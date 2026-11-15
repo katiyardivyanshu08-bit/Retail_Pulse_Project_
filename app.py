@@ -23,6 +23,7 @@ import streamlit as st
 # =====================================================================
 DEFAULT_DATA_PATH = "Data/Main_Clean.csv"
 KMEANS_MODEL_PATH = "Models/kmeans_model.pkl"     # optional default dataset if no CSV is uploaded
+SPENDING_MODEL_PATH = "Models/annual_spending_model.joblib"
 
 # Map the dashboard fields to YOUR column names.
 # Leave a value as None to auto-detect from the CSV column names.
@@ -475,6 +476,398 @@ def render_customer_segmentation():
                 </div>
             </div>
             """, unsafe_allow_html=True)
+SPENDING_FEATURES = [
+    "PurchaseFrequency",
+    "AnnualIncome",
+    "Recency",
+    "CustomerTenure",
+    "ReturnRate",
+    "Age",
+]
+
+
+@st.cache_resource
+def load_spending_model(path: str = SPENDING_MODEL_PATH):
+    """Loads and caches the pre-trained Annual Spending regression pipeline."""
+    if not os.path.exists(path):
+        return None, f"Regression model file not found at `{path}`."
+    try:
+        reg_model = joblib.load(path)
+        if not hasattr(reg_model, "predict"):
+            return None, f"Loaded object at `{path}` does not expose a `.predict()` method."
+        return reg_model, None
+    except Exception as exc:
+        return None, f"Failed to load spending prediction model: {exc}"
+
+
+def render_spending_prediction():
+    """Renders the Spending Prediction page using the active dataset and Models/annual_spending_model.joblib."""
+    st.markdown(
+        '<div class="welcome">Spending <span style="color:#4f63e8">Prediction</span></div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        '<div class="tagline">Forecast customer annual purchase amounts &nbsp;•&nbsp; '
+        'HistGradientBoosting regression pipeline &nbsp;•&nbsp; Individual &amp; cohort telemetry</div>',
+        unsafe_allow_html=True,
+    )
+
+    raw, source_name = get_active_raw()
+    if raw is None or raw.empty:
+        st.markdown(
+            """<div class="vacant"><div style="font-size:2.5rem">📂</div>
+            <h3>No dataset available</h3>
+            <p>Ensure <b>Data/Main_Clean.csv</b> exists or upload a CSV/Excel file in the left sidebar.</p></div>""",
+            unsafe_allow_html=True,
+        )
+        return
+
+    st.markdown(
+        f'<div style="color:#334155;font-size:0.84rem;font-weight:600;margin:-4px 0 12px 0;">'
+        f'📁 Active Dataset: <span style="color:#111a3b;">{source_name}</span> ({len(raw):,} total records)</div>',
+        unsafe_allow_html=True,
+    )
+
+    reg_model, model_err = load_spending_model()
+    if model_err:
+        st.error(f"❌ {model_err}")
+        return
+
+    expected_features = (
+        list(reg_model.feature_names_in_)
+        if hasattr(reg_model, "feature_names_in_")
+        else list(SPENDING_FEATURES)
+    )
+
+    # ---------------- B. INDIVIDUAL CUSTOMER PREDICTION ----------------
+    with st.container(border=True):
+        st.markdown('<div class="ct">🧮 Individual Customer Prediction</div>', unsafe_allow_html=True)
+
+        def _col_median(col_name: str, fallback: float) -> float:
+            if col_name in raw.columns:
+                s = pd.to_numeric(raw[col_name], errors="coerce").dropna()
+                if not s.empty:
+                    return float(s.median())
+            return fallback
+
+        with st.form("individual_spending_form"):
+            r1c1, r1c2, r1c3 = st.columns(3)
+            with r1c1:
+                in_freq = st.number_input(
+                    "Purchase Frequency (orders/yr)",
+                    min_value=0.0,
+                    max_value=500.0,
+                    value=round(_col_median("PurchaseFrequency", 6.0), 1),
+                    step=1.0,
+                )
+            with r1c2:
+                in_income = st.number_input(
+                    f"Annual Income ({CURRENCY})",
+                    min_value=0.0,
+                    max_value=50_000_000.0,
+                    value=round(_col_median("AnnualIncome", 60000.0), 2),
+                    step=1000.0,
+                )
+            with r1c3:
+                in_recency = st.number_input(
+                    "Recency (days since last purchase)",
+                    min_value=0,
+                    max_value=3650,
+                    value=int(round(_col_median("Recency", 45.0))),
+                    step=1,
+                )
+
+            r2c1, r2c2, r2c3 = st.columns(3)
+            with r2c1:
+                in_tenure = st.number_input(
+                    "Customer Tenure (years)",
+                    min_value=0.0,
+                    max_value=100.0,
+                    value=round(_col_median("CustomerTenure", 3.5), 2),
+                    step=0.5,
+                )
+            with r2c2:
+                in_return = st.number_input(
+                    "Return Rate (0.00 – 1.00)",
+                    min_value=0.0,
+                    max_value=1.0,
+                    value=round(min(max(_col_median("ReturnRate", 0.08), 0.0), 1.0), 4),
+                    step=0.01,
+                    format="%.4f",
+                )
+            with r2c3:
+                in_age = st.number_input(
+                    "Age (years)",
+                    min_value=18,
+                    max_value=110,
+                    value=int(round(min(max(_col_median("Age", 35.0), 18), 110))),
+                    step=1,
+                )
+
+            submitted = st.form_submit_button("Predict Annual Spending")
+
+        if submitted:
+            input_values = {
+                "PurchaseFrequency": in_freq,
+                "AnnualIncome": in_income,
+                "Recency": in_recency,
+                "CustomerTenure": in_tenure,
+                "ReturnRate": in_return,
+                "Age": in_age,
+            }
+            if any(v is None or pd.isna(v) for v in input_values.values()):
+                st.error("❌ All 6 input fields are required and must contain valid numeric values.")
+            elif in_income <= 0:
+                st.error("❌ Annual Income must be greater than ₹ 0.")
+            else:
+                single_df = pd.DataFrame([input_values])[expected_features]
+                pred_single = float(reg_model.predict(single_df)[0])
+                pred_single = max(0.0, pred_single)
+                st.markdown(
+                    f"""
+                    <div style="background:#eef2ff;border-left:4px solid #4f63e8;border-radius:10px;
+                                padding:14px 18px;margin-top:8px;display:flex;justify-content:space-between;align-items:center;">
+                        <div>
+                            <div style="font-size:0.78rem;color:#475569;font-weight:600;">ESTIMATED ANNUAL SPENDING</div>
+                            <div style="font-size:1.65rem;font-weight:800;color:#111a3b;">{format_inr(pred_single)}</div>
+                        </div>
+                        <div style="font-size:0.78rem;color:#475569;text-align:right;">
+                            Exact Value: <b>{CURRENCY} {pred_single:,.2f}</b><br>
+                            Pipeline: HistGradientBoostingRegressor
+                        </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+    st.write("")
+
+    # ---------------- DATASET FEATURE VALIDATION & BATCH PREDICTION ----------------
+    missing_cols = [col for col in expected_features if col not in raw.columns]
+    if missing_cols:
+        st.warning(
+            f"⚠️ Dataset-level prediction skipped because required model feature(s) are missing from "
+            f"**{source_name}**: **{', '.join(missing_cols)}**. Expected features: `{expected_features}`."
+        )
+        return
+
+    # Preserve all customer rows; coerce features to numeric and let pipeline SimpleImputer handle nulls
+    work_df = raw.copy()
+    feat_df = pd.DataFrame(index=work_df.index)
+    for feat in expected_features:
+        feat_df[feat] = pd.to_numeric(work_df[feat], errors="coerce")
+
+    if feat_df.isna().all().all():
+        st.warning("⚠️ None of the required model features contain valid numeric values in the active dataset.")
+        return
+
+    # Apply Top Search Filter if typed
+    q = st.session_state.get("search", "").strip().lower()
+    if q:
+        search_cols = [c for c in ["CustomerID", "Region", "Gender", "ProductCategory"] if c in work_df.columns]
+        if search_cols:
+            mask = work_df[search_cols].astype(str).apply(lambda s: s.str.lower().str.contains(q)).any(axis=1)
+            work_df = work_df.loc[mask].copy()
+            feat_df = feat_df.loc[mask].copy()
+            if work_df.empty:
+                st.warning(f"No customers match “{q}”.")
+                return
+
+    preds = np.clip(reg_model.predict(feat_df[expected_features]), 0.0, None)
+    work_df["PredictedAnnualSpending"] = preds
+
+    has_actual = "AnnualPurchaseAmount" in work_df.columns
+    if has_actual:
+        work_df["_actual_spend"] = pd.to_numeric(work_df["AnnualPurchaseAmount"], errors="coerce")
+        has_actual = bool(work_df["_actual_spend"].notna().any())
+
+    # ---------------- A. PREDICTION OVERVIEW (4 KPI CARDS) ----------------
+    st.markdown('<div class="sec" style="margin-bottom:8px;">Prediction Overview</div>', unsafe_allow_html=True)
+    total_cust = len(work_df)
+    avg_pred = float(np.mean(preds))
+
+    c = st.columns(4)
+    kpi(c[0], "👥", "Total Customers", f"{total_cust:,}", "Active cohort evaluated", "#e8f1fd")
+
+    if has_actual:
+        valid_comp = work_df.dropna(subset=["_actual_spend"])
+        avg_actual = float(valid_comp["_actual_spend"].mean())
+        avg_diff = float((valid_comp["PredictedAnnualSpending"] - valid_comp["_actual_spend"]).mean())
+        mae_val = float((valid_comp["PredictedAnnualSpending"] - valid_comp["_actual_spend"]).abs().mean())
+        diff_sign = "+" if avg_diff >= 0 else "-"
+
+        kpi(c[1], "🧾", "Avg. Actual Spend", money(avg_actual), f"Across {len(valid_comp):,} actual records", "#e3f6ec")
+        kpi(c[2], "📈", "Avg. Predicted Spend", money(avg_pred), f"Median {money(float(np.median(preds)))}", "#f0eafd")
+        kpi(
+            c[3],
+            "⚖️",
+            "Avg. Prediction Diff",
+            f"{diff_sign}{CURRENCY} {abs(avg_diff):,.0f}",
+            f"Mean Abs Error: {money(mae_val)}",
+            "#fdf3df",
+        )
+    else:
+        kpi(c[1], "🧾", "Avg. Actual Spend", "N/A", "Actual target column absent", "#e3f6ec")
+        kpi(c[2], "📈", "Avg. Predicted Spend", money(avg_pred), f"Median {money(float(np.median(preds)))}", "#f0eafd")
+        kpi(c[3], "⚖️", "Avg. Prediction Diff", "N/A", "Requires AnnualPurchaseAmount", "#fdf3df")
+
+    st.write("")
+
+    # ---------------- C. PREDICTION ANALYSIS (PLOTLY CHARTS + SUMMARY) ----------------
+    st.markdown('<div class="sec" style="margin-bottom:8px;">Prediction Analysis</div>', unsafe_allow_html=True)
+    ch1, ch2 = st.columns(2)
+
+    with ch1:
+        st.markdown('<div class="card"><h4>Predicted Annual Spending Distribution</h4>', unsafe_allow_html=True)
+        hist_sample = (
+            work_df["PredictedAnnualSpending"].sample(min(50_000, len(work_df)), random_state=42)
+        )
+        fig_hist = px.histogram(
+            hist_sample,
+            x="PredictedAnnualSpending",
+            nbins=30,
+            color_discrete_sequence=["#4f63e8"],
+        )
+        fig_hist.add_vline(
+            x=avg_pred,
+            line_dash="dash",
+            line_color="#22c277",
+            line_width=2,
+            annotation_text=f"Mean: {money(avg_pred)}",
+            annotation_position="top right",
+            annotation_font=dict(size=11, color="#172033"),
+        )
+        fig_hist.update_xaxes(title_text=f"Predicted Annual Spend ({CURRENCY})", tickprefix=CURRENCY, tickformat="~s")
+        fig_hist.update_yaxes(title_text="Customer Count", gridcolor="#e2e8f0")
+        fig_hist.update_traces(
+            marker_line_width=1,
+            marker_line_color="#3b82f6",
+            hovertemplate="<b>Range:</b> %{x}<br><b>Customers:</b> %{y:,}<extra></extra>",
+        )
+        st.plotly_chart(style_chart(fig_hist, h=320), use_container_width=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    with ch2:
+        if has_actual:
+            st.markdown('<div class="card"><h4>Actual vs. Predicted Annual Spending</h4>', unsafe_allow_html=True)
+            comp_df = work_df.dropna(subset=["_actual_spend"])[["_actual_spend", "PredictedAnnualSpending"]].copy()
+            comp_sample = comp_df.sample(min(4000, len(comp_df)), random_state=42)
+            low_v = float(min(comp_sample["_actual_spend"].min(), comp_sample["PredictedAnnualSpending"].min()))
+            high_v = float(max(comp_sample["_actual_spend"].max(), comp_sample["PredictedAnnualSpending"].max()))
+
+            fig_scat = go.Figure()
+            fig_scat.add_trace(
+                go.Scattergl(
+                    x=comp_sample["_actual_spend"],
+                    y=comp_sample["PredictedAnnualSpending"],
+                    mode="markers",
+                    name="Customers",
+                    marker=dict(color="#3b82f6", size=5, opacity=0.45),
+                    hovertemplate=f"<b>Actual:</b> {CURRENCY}%{{x:,.0f}}<br><b>Predicted:</b> {CURRENCY}%{{y:,.0f}}<extra></extra>",
+                )
+            )
+            fig_scat.add_trace(
+                go.Scatter(
+                    x=[low_v, high_v],
+                    y=[low_v, high_v],
+                    mode="lines",
+                    name="Ideal Fit (y = x)",
+                    line=dict(color="#fb923c", width=2, dash="dash"),
+                )
+            )
+            fig_scat.update_xaxes(title_text=f"Actual Annual Spend ({CURRENCY})", tickprefix=CURRENCY, tickformat="~s", gridcolor="#e2e8f0")
+            fig_scat.update_yaxes(title_text=f"Predicted Annual Spend ({CURRENCY})", tickprefix=CURRENCY, tickformat="~s", gridcolor="#e2e8f0")
+            fig_scat.update_layout(legend=dict(orientation="h", x=0, y=1.08))
+            st.plotly_chart(style_chart(fig_scat, h=320), use_container_width=True)
+            st.markdown("</div>", unsafe_allow_html=True)
+        else:
+            st.markdown('<div class="card"><h4>Predicted Spending Brackets</h4>', unsafe_allow_html=True)
+            p_bins = pd.qcut(work_df["PredictedAnnualSpending"], q=4, duplicates="drop")
+            b_labels = [f"{CURRENCY}{int(iv.left):,}–{int(iv.right):,}" for iv in p_bins.cat.categories]
+            b_counts = p_bins.cat.rename_categories(b_labels).value_counts().sort_index()
+            fig_brk = go.Figure(
+                go.Bar(
+                    x=b_counts.index.astype(str),
+                    y=b_counts.values,
+                    marker_color=PALETTE[: len(b_counts)],
+                    text=[f"{v:,}" for v in b_counts.values],
+                    textposition="outside",
+                    cliponaxis=False,
+                    textfont=dict(size=11, color="#172033"),
+                )
+            )
+            fig_brk.update_yaxes(range=[0, b_counts.max() * 1.25], gridcolor="#e2e8f0", title_text="Customers")
+            st.plotly_chart(style_chart(fig_brk, h=320), use_container_width=True)
+            st.markdown("</div>", unsafe_allow_html=True)
+
+    # Prediction Summary Strip
+    p25, p50, p75 = np.percentile(preds, [25, 50, 75])
+    if has_actual:
+        valid_r2 = work_df.dropna(subset=["_actual_spend"])
+        ss_res = float(((valid_r2["_actual_spend"] - valid_r2["PredictedAnnualSpending"]) ** 2).sum())
+        ss_tot = float(((valid_r2["_actual_spend"] - valid_r2["_actual_spend"].mean()) ** 2).sum())
+        r2_val = 1.0 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
+        summary_html = (
+            f"<b>Prediction Summary:</b> Across <b>{total_cust:,}</b> customers, predicted annual spending spans an "
+            f"interquartile range of <b>{money(p25)}</b> (25th) to <b>{money(p75)}</b> (75th) with a median of "
+            f"<b>{money(p50)}</b>. Against observed `AnnualPurchaseAmount` values, the model achieves an "
+            f"<b>R² of {r2_val:.4f}</b> and a mean absolute error of <b>{money(mae_val)}</b>."
+        )
+    else:
+        summary_html = (
+            f"<b>Prediction Summary:</b> Across <b>{total_cust:,}</b> customers, predicted annual spending spans an "
+            f"interquartile range of <b>{money(p25)}</b> (25th) to <b>{money(p75)}</b> (75th) with a median of "
+            f"<b>{money(p50)}</b>."
+        )
+    st.markdown(
+        f'<div class="card" style="font-size:0.84rem;color:#334155;">{summary_html}</div>',
+        unsafe_allow_html=True,
+    )
+
+    st.write("")
+
+    # ---------------- D. CUSTOMER PREDICTION RESULTS TABLE ----------------
+    with st.container(border=True):
+        st.markdown('<div class="ct">📋 Customer Prediction Results</div>', unsafe_allow_html=True)
+        t_col1, t_col2 = st.columns([1.2, 2.8])
+        with t_col1:
+            row_limit = st.selectbox(
+                "Rows to display",
+                options=[25, 100, 500, 1000],
+                index=1,
+                key="pred_table_limit",
+            )
+        with t_col2:
+            st.markdown(
+                f'<div style="color:#475569;font-size:0.8rem;padding-top:30px;">'
+                f'Showing top <b>{min(row_limit, total_cust):,}</b> of <b>{total_cust:,}</b> customers '
+                f'(all rows preserved, including imputed feature nulls).</div>',
+                unsafe_allow_html=True,
+            )
+
+        display_cols = []
+        if "CustomerID" in work_df.columns:
+            display_cols.append("CustomerID")
+        for feat in expected_features:
+            if feat in work_df.columns:
+                display_cols.append(feat)
+
+        table_df = work_df[display_cols].head(row_limit).copy()
+        if has_actual:
+            table_df["ActualAnnualPurchaseAmount"] = work_df["_actual_spend"].head(row_limit).round(2)
+        table_df["PredictedAnnualSpending"] = work_df["PredictedAnnualSpending"].head(row_limit).round(2)
+        if has_actual:
+            table_df["Difference (Pred - Actual)"] = (
+                table_df["PredictedAnnualSpending"] - table_df["ActualAnnualPurchaseAmount"]
+            ).round(2)
+
+        col_cfg = {
+            "AnnualIncome": st.column_config.NumberColumn(f"Annual Income ({CURRENCY})", format=f"{CURRENCY} %.2f"),
+            "ActualAnnualPurchaseAmount": st.column_config.NumberColumn(f"Actual Spend ({CURRENCY})", format=f"{CURRENCY} %.2f"),
+            "PredictedAnnualSpending": st.column_config.NumberColumn(f"Predicted Spend ({CURRENCY})", format=f"{CURRENCY} %.2f"),
+            "Difference (Pred - Actual)": st.column_config.NumberColumn(f"Difference ({CURRENCY})", format=f"{CURRENCY} %.2f"),
+        }
+        st.dataframe(table_df, hide_index=True, use_container_width=True, column_config=col_cfg)            
 def guess(cols, keywords, exclude=()):
     for kw in keywords:
         for c in cols:
@@ -974,6 +1367,9 @@ if page == "Overview":
 # =====================================================================
 elif page == "Customer Segmentation":
     render_customer_segmentation()
+
+elif page == "Spending Prediction":
+    render_spending_prediction()
 
 
 # =====================================================================
