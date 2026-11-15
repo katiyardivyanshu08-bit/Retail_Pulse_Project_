@@ -500,15 +500,703 @@ def load_spending_model(path: str = SPENDING_MODEL_PATH):
         return None, f"Failed to load spending prediction model: {exc}"
 
 
+def _resolve_recency_column(work_df: pd.DataFrame) -> pd.DataFrame:
+    """Uses existing Recency column if present; otherwise derives it from LastPurchaseDate using the dataset reference date (2025-12-31)."""
+    if "Recency" not in work_df.columns and "LastPurchaseDate" in work_df.columns:
+        parsed_dates = pd.to_datetime(work_df["LastPurchaseDate"], errors="coerce")
+        work_df["Recency"] = (pd.Timestamp("2025-12-31") - parsed_dates).dt.days
+    return work_df
+
+
+def _assign_spending_potential_groups(pred_series: pd.Series) -> tuple[pd.Series, float, float]:
+    """
+    Derives mutually exclusive Spending Potential groups using 25th and 75th percentiles
+    computed on the full active dataset BEFORE filtering:
+      - High Spending Potential:   pred > p75
+      - Medium Spending Potential: p25 <= pred <= p75
+      - Low Spending Potential:    pred < p25
+    """
+    valid = pred_series.dropna()
+    if valid.empty:
+        return pd.Series("Unknown", index=pred_series.index), np.nan, np.nan
+
+    p25 = float(np.percentile(valid, 25))
+    p75 = float(np.percentile(valid, 75))
+
+    groups = pd.Series("Medium Spending Potential", index=pred_series.index, dtype="object")
+    groups[pred_series.isna()] = "Unknown"
+    groups[pred_series > p75] = "High Spending Potential"
+    groups[pred_series < p25] = "Low Spending Potential"
+    return groups, p25, p75
+
+
+def _apply_spending_filters(work_df: pd.DataFrame) -> pd.DataFrame:
+    """Renders Region, Age Group, and Product Category multiselect filters matching Customer Segmentation."""
+    with st.container(border=True):
+        st.markdown('<div class="ct">🎛️ Cohort Filters</div>', unsafe_allow_html=True)
+        f1, f2, f3 = st.columns(3)
+        filtered = work_df.copy()
+
+        with f1:
+            if "Region" in filtered.columns:
+                reg_opts = sorted(filtered["Region"].dropna().astype(str).unique().tolist())
+                sel_reg = st.multiselect(
+                    "Region",
+                    options=reg_opts,
+                    default=[],
+                    placeholder="All Regions",
+                    key="sp_filter_region",
+                )
+                if sel_reg:
+                    filtered = filtered[filtered["Region"].astype(str).isin(sel_reg)]
+            else:
+                st.selectbox("Region", options=["Column not in dataset"], disabled=True, key="sp_reg_na")
+
+        with f2:
+            if "Age" in filtered.columns:
+                age_options = ["18–25 years", "26–35 years", "36–50 years", "50+ years"]
+                sel_ages = st.multiselect(
+                    "Age Group",
+                    options=age_options,
+                    default=[],
+                    placeholder="All Age Groups",
+                    key="sp_filter_age_group",
+                )
+                if sel_ages:
+                    age_num = pd.to_numeric(filtered["Age"], errors="coerce")
+                    age_mask = pd.Series(False, index=filtered.index)
+                    if "18–25 years" in sel_ages:
+                        age_mask |= (age_num >= 18) & (age_num <= 25)
+                    if "26–35 years" in sel_ages:
+                        age_mask |= (age_num >= 26) & (age_num <= 35)
+                    if "36–50 years" in sel_ages:
+                        age_mask |= (age_num >= 36) & (age_num <= 50)
+                    if "50+ years" in sel_ages:
+                        age_mask |= (age_num > 50)
+                    filtered = filtered[age_mask]
+            else:
+                st.selectbox("Age Group", options=["Column not in dataset"], disabled=True, key="sp_age_na")
+
+        with f3:
+            if "ProductCategory" in filtered.columns:
+                cat_opts = sorted(filtered["ProductCategory"].dropna().astype(str).unique().tolist())
+                sel_cat = st.multiselect(
+                    "Product Category",
+                    options=cat_opts,
+                    default=[],
+                    placeholder="All Categories",
+                    key="sp_filter_cat",
+                )
+                if sel_cat:
+                    filtered = filtered[filtered["ProductCategory"].astype(str).isin(sel_cat)]
+            else:
+                st.selectbox("Product Category", options=["Column not in dataset"], disabled=True, key="sp_cat_na")
+
+    return filtered
+
+
+def _build_grouped_potential_table(df_sub: pd.DataFrame, group_col: str, label_col: str) -> pd.DataFrame:
+    """Aggregates customer counts, predicted spending stats, and high-potential share by group_col."""
+    rows = []
+    for grp_val, grp_df in df_sub.groupby(group_col, dropna=True):
+        cnt = int(len(grp_df))
+        pred_s = grp_df["PredictedAnnualPurchaseAmount"].dropna()
+        avg_pred = float(pred_s.mean()) if not pred_s.empty else np.nan
+        med_pred = float(pred_s.median()) if not pred_s.empty else np.nan
+        tot_pred = float(pred_s.sum()) if not pred_s.empty else 0.0
+        hp_cnt = int((grp_df["SpendingPotentialGroup"] == "High Spending Potential").sum())
+        hp_pct = (hp_cnt / cnt * 100.0) if cnt > 0 else 0.0
+
+        rows.append({
+            label_col: str(grp_val),
+            "Customer Count": cnt,
+            "_avg_pred": avg_pred,
+            "_med_pred": med_pred,
+            "_tot_pred": tot_pred,
+            "_hp_cnt": hp_cnt,
+            "_hp_pct": hp_pct,
+        })
+
+    if not rows:
+        return pd.DataFrame()
+    return (
+        pd.DataFrame(rows)
+        .sort_values(by="_avg_pred", ascending=False, na_position="last")
+        .reset_index(drop=True)
+    )
+
+
 def render_spending_prediction():
-    """Renders the Spending Prediction page using the active dataset and Models/annual_spending_model.joblib."""
+    """Business Intelligence dashboard analyzing predicted annual spending potential across cohorts, regions, and product categories."""
+    # 1. Page Title & Short Description
     st.markdown(
         '<div class="welcome">Spending <span style="color:#4f63e8">Prediction</span></div>',
         unsafe_allow_html=True,
     )
     st.markdown(
-        '<div class="tagline">Forecast customer annual purchase amounts &nbsp;•&nbsp; '
-        'HistGradientBoosting regression pipeline &nbsp;•&nbsp; Individual &amp; cohort telemetry</div>',
+        '<div class="tagline">Analyze predicted annual spending potential &nbsp;•&nbsp; '
+        'Identify high-potential cohorts &nbsp;•&nbsp; Guide targeted retention &amp; marketing strategy</div>',
+        unsafe_allow_html=True,
+    )
+
+    # 2. Active Dataset Information & Saved Pipeline Loading
+    raw, source_name = get_active_raw()
+    if raw is None or raw.empty:
+        st.markdown(
+            """<div class="vacant"><div style="font-size:2.5rem">📂</div>
+            <h3>No dataset available</h3>
+            <p>Ensure <b>Data/Main_Clean.csv</b> exists or upload a CSV/Excel file in the left sidebar.</p></div>""",
+            unsafe_allow_html=True,
+        )
+        return
+
+    st.markdown(
+        f'<div style="color:#334155;font-size:0.84rem;font-weight:600;margin:-4px 0 12px 0;">'
+        f'📁 Active Dataset: <span style="color:#111a3b;">{source_name}</span> ({len(raw):,} total records)</div>',
+        unsafe_allow_html=True,
+    )
+
+    reg_model, model_err = load_spending_model()
+    if model_err:
+        st.error(f"❌ {model_err}")
+        return
+
+    expected_features = (
+        list(reg_model.feature_names_in_)
+        if hasattr(reg_model, "feature_names_in_")
+        else list(SPENDING_FEATURES)
+    )
+
+    # Preserve original dataset columns & rows; compute Recency only if absent
+    work_df = _resolve_recency_column(raw.copy())
+    if "CustomerTenure" not in work_df.columns and "CustomerTenureMonths" in work_df.columns:
+        work_df["CustomerTenure"] = pd.to_numeric(work_df["CustomerTenureMonths"], errors="coerce") / 12.0
+
+    norm_col_map = {c.lower().replace(" ", "").replace("_", ""): c for c in work_df.columns}
+    missing_cols = []
+    feat_df = pd.DataFrame(index=work_df.index)
+
+    for feat in expected_features:
+        if feat in work_df.columns:
+            feat_df[feat] = pd.to_numeric(work_df[feat], errors="coerce")
+        else:
+            matched = norm_col_map.get(feat.lower().replace(" ", "").replace("_", ""))
+            if matched is not None:
+                feat_df[feat] = pd.to_numeric(work_df[matched], errors="coerce")
+            else:
+                missing_cols.append(feat)
+                feat_df[feat] = np.nan
+
+    if missing_cols:
+        st.warning(
+            f"⚠️ Required model feature(s) missing from **{source_name}**: **{', '.join(missing_cols)}**. "
+            f"Expected features: `{expected_features}`."
+        )
+        return
+
+    if feat_df.isna().all().all():
+        st.warning("⚠️ None of the required model features contain valid numeric values in the active dataset.")
+        return
+
+    # Run saved pipeline directly without retraining or manual scaling/imputation
+    work_df["PredictedAnnualPurchaseAmount"] = np.clip(
+        reg_model.predict(feat_df[expected_features]), 0.0, None
+    )
+
+    # Calculate 25th & 75th percentile thresholds on the COMPLETE active dataset BEFORE filtering
+    work_df["SpendingPotentialGroup"], p25_full, p75_full = _assign_spending_potential_groups(
+        work_df["PredictedAnnualPurchaseAmount"]
+    )
+
+    # Apply Top Search Bar filter if typed
+    q = st.session_state.get("search", "").strip().lower()
+    if q:
+        search_cols = [
+            c for c in ["CustomerID", "Region", "Gender", "ProductCategory", "SpendingPotentialGroup"]
+            if c in work_df.columns
+        ]
+        if search_cols:
+            mask = work_df[search_cols].astype(str).apply(lambda s: s.str.lower().str.contains(q)).any(axis=1)
+            work_df = work_df.loc[mask].copy()
+            if work_df.empty:
+                st.warning(f"No customers match “{q}”.")
+                return
+
+    # 3. Filters (Region, Age Group, Product Category)
+    filtered_df = _apply_spending_filters(work_df)
+    if filtered_df.empty:
+        st.warning("⚠️ No customers match the selected filters. Clear one or more filters to view spending potential.")
+        return
+
+    st.write("")
+
+    # 4. Four KPI Cards
+    total_cust = int(len(filtered_df))
+    pred_s = filtered_df["PredictedAnnualPurchaseAmount"].dropna()
+    avg_pred = float(pred_s.mean()) if not pred_s.empty else 0.0
+    tot_pred = float(pred_s.sum()) if not pred_s.empty else 0.0
+    high_cnt = int((filtered_df["SpendingPotentialGroup"] == "High Spending Potential").sum())
+    high_pct = (high_cnt / total_cust * 100.0) if total_cust > 0 else 0.0
+
+    c = st.columns(4)
+    kpi(c[0], "👥", "Total Customers", f"{total_cust:,}", "Filtered customer cohort", "#e8f1fd")
+    kpi(c[1], "📈", "Avg. Predicted Annual Spending", money(avg_pred), "Per-customer model estimate", "#e3f6ec")
+    kpi(c[2], "💼", "Total Predicted Annual Spending", format_inr(tot_pred), "Estimated cohort spend (not actual revenue)", "#f0eafd")
+    kpi(c[3], "🌟", "High-Potential Customers", f"{high_cnt:,}", f"{high_pct:.1f}% of filtered cohort (> {money(p75_full)})", "#fdf3df")
+
+    st.write("")
+
+    # 5. Customer Predicted Annual Spending Distribution
+    st.markdown('<div class="sec" style="margin-bottom:8px;">Customer Predicted Annual Spending Distribution</div>', unsafe_allow_html=True)
+    with st.container(border=True):
+        st.markdown('<div class="ct">📊 Customer Predicted Annual Spending Distribution</div>', unsafe_allow_html=True)
+        hist_vals = pred_s.sample(min(50_000, len(pred_s)), random_state=42) if len(pred_s) > 50_000 else pred_s
+        fig_dist = px.histogram(
+            hist_vals,
+            x="PredictedAnnualPurchaseAmount",
+            nbins=28,
+            color_discrete_sequence=["#4f63e8"],
+        )
+        fig_dist.add_vline(
+            x=avg_pred,
+            line_dash="dash",
+            line_color="#22c277",
+            line_width=2,
+            annotation_text=f"Cohort Mean: {money(avg_pred)}",
+            annotation_position="top right",
+            annotation_font=dict(size=11, color="#172033"),
+        )
+        fig_dist.update_traces(
+            marker_line_width=1,
+            marker_line_color="#3b82f6",
+            hovertemplate=f"<b>Predicted Spend Range:</b> {CURRENCY}%{{x}}<br><b>Customers:</b> %{{y:,}}<extra></extra>",
+        )
+        fig_dist = style_chart(fig_dist, h=300)
+        fig_dist.update_layout(margin=dict(l=12, r=16, t=28, b=16))
+        fig_dist.update_xaxes(
+            title_text=f"Predicted Annual Spending ({CURRENCY})",
+            tickprefix=CURRENCY,
+            tickformat="~s",
+            gridcolor="#e2e8f0",
+        )
+        fig_dist.update_yaxes(title_text="Number of Customers", gridcolor="#e2e8f0")
+        st.plotly_chart(fig_dist, use_container_width=True)
+
+    st.write("")
+
+    # 6. Customer Spending Potential Segmentation (Percentile-Based)
+    st.markdown('<div class="sec" style="margin-bottom:4px;">Customer Spending Potential Segmentation</div>', unsafe_allow_html=True)
+    st.markdown(
+        f'<div style="color:#475569;font-size:0.82rem;margin-bottom:10px;">'
+        f'ℹ️ Derived model-based spending tiers using full-dataset percentile thresholds '
+        f'(<b>Low:</b> &lt; {money(p25_full)} &nbsp;|&nbsp; '
+        f'<b>Medium:</b> {money(p25_full)}–{money(p75_full)} &nbsp;|&nbsp; '
+        f'<b>High:</b> &gt; {money(p75_full)}). These reflect predicted spending potential, not guaranteed revenue.</div>',
+        unsafe_allow_html=True,
+    )
+
+    pot_order = ["High Spending Potential", "Medium Spending Potential", "Low Spending Potential"]
+    pot_short = {
+        "High Spending Potential": "High Potential",
+        "Medium Spending Potential": "Medium Potential",
+        "Low Spending Potential": "Low Potential",
+    }
+    pot_colors = {
+        "High Spending Potential": "#3b82f6",    # Blue
+        "Medium Spending Potential": "#22c277",  # Green
+        "Low Spending Potential": "#fb923c",     # Orange
+    }
+
+    pot_counts = filtered_df["SpendingPotentialGroup"].value_counts()
+    sp_c1, sp_c2 = st.columns([1, 1.2])
+
+    with sp_c1:
+        st.markdown('<div class="card"><h4>Customer Share by Spending Potential</h4>', unsafe_allow_html=True)
+        d_vals = [int(pot_counts.get(g, 0)) for g in pot_order]
+        d_labels = [f"{pot_short[g]} ({pot_counts.get(g, 0):,})" for g in pot_order]
+        d_colors = [pot_colors[g] for g in pot_order]
+
+        fig_pot_donut = go.Figure(go.Pie(
+            labels=d_labels,
+            values=d_vals,
+            hole=0.56,
+            sort=False,
+            marker=dict(colors=d_colors, line=dict(color="#ffffff", width=2)),
+            textinfo="percent",
+            textposition="inside",
+            insidetextorientation="horizontal",
+            textfont=dict(size=12, color="#ffffff"),
+            customdata=pot_order,
+            hovertemplate="<b>%{customdata}</b><br>Customers: %{value:,}<br>Share: %{percent}<extra></extra>",
+        ))
+        fig_pot_donut.add_annotation(
+            text=f"<b>{total_cust:,}</b><br>Customers",
+            showarrow=False,
+            font=dict(size=13, color="#172033"),
+        )
+        fig_pot_donut = style_chart(fig_pot_donut, h=310)
+        fig_pot_donut.update_layout(
+            margin=dict(l=16, r=16, t=20, b=44),
+            legend=dict(orientation="h", x=0.5, xanchor="center", y=-0.08, font=dict(size=11, color="#172033")),
+        )
+        st.plotly_chart(fig_pot_donut, use_container_width=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    with sp_c2:
+        st.markdown('<div class="card"><h4>Average Predicted Annual Spending by Group</h4>', unsafe_allow_html=True)
+        avg_pot = (
+            filtered_df.groupby("SpendingPotentialGroup")["PredictedAnnualPurchaseAmount"]
+            .mean()
+            .reindex(pot_order)
+            .fillna(0.0)
+        )
+        fig_pot_bar = go.Figure(go.Bar(
+            x=[pot_short[g] for g in pot_order],
+            y=avg_pot.values,
+            marker_color=[pot_colors[g] for g in pot_order],
+            text=[money(v) for v in avg_pot.values],
+            textposition="outside",
+            cliponaxis=False,
+            textfont=dict(size=12, color="#172033"),
+            customdata=pot_order,
+            hovertemplate="<b>%{customdata}</b><br>Avg Predicted Spend: %{text}<extra></extra>",
+        ))
+        max_pot_y = float(avg_pot.max()) if avg_pot.max() > 0 else 1000.0
+        fig_pot_bar = style_chart(fig_pot_bar, h=310)
+        fig_pot_bar.update_layout(margin=dict(l=12, r=16, t=24, b=16), showlegend=False)
+        fig_pot_bar.update_yaxes(
+            range=[0, max_pot_y * 1.28],
+            gridcolor="#e2e8f0",
+            tickprefix=CURRENCY,
+            tickformat="~s",
+            title_text=f"Avg Predicted Spend ({CURRENCY})",
+        )
+        st.plotly_chart(fig_pot_bar, use_container_width=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    with st.container(border=True):
+        st.markdown('<div class="ct">📋 Spending Potential Summary</div>', unsafe_allow_html=True)
+        pot_rows = []
+        for g in pot_order:
+            sub = filtered_df[filtered_df["SpendingPotentialGroup"] == g]
+            cnt = int(len(sub))
+            pct = (cnt / total_cust * 100.0) if total_cust > 0 else 0.0
+            s_p = sub["PredictedAnnualPurchaseAmount"].dropna()
+            pot_rows.append({
+                "Spending Potential Group": g,
+                "Customer Count": f"{cnt:,}",
+                "Customer Percentage": f"{pct:.1f}%",
+                "Average Predicted Annual Spending": money(float(s_p.mean())) if not s_p.empty else "N/A",
+                "Median Predicted Annual Spending": money(float(s_p.median())) if not s_p.empty else "N/A",
+                "Total Predicted Annual Spending": format_inr(float(s_p.sum())) if not s_p.empty else "N/A",
+            })
+        st.dataframe(pd.DataFrame(pot_rows), hide_index=True, use_container_width=True)
+
+    st.write("")
+
+    # 7. Regional Spending Potential
+    reg_summary = pd.DataFrame()
+    if "Region" in filtered_df.columns and filtered_df["Region"].notna().any():
+        st.markdown('<div class="sec" style="margin-bottom:8px;">Regional Spending Potential</div>', unsafe_allow_html=True)
+        reg_summary = _build_grouped_potential_table(filtered_df, "Region", "Region")
+
+        if not reg_summary.empty:
+            r_chart_col, r_tbl_col = st.columns([1.15, 1.25])
+            with r_chart_col:
+                st.markdown('<div class="card"><h4>Average Predicted Annual Spending by Region</h4>', unsafe_allow_html=True)
+                fig_reg = go.Figure(go.Bar(
+                    x=reg_summary["Region"],
+                    y=reg_summary["_avg_pred"],
+                    marker_color=PALETTE[: len(reg_summary)],
+                    text=[money(v) if pd.notna(v) else "N/A" for v in reg_summary["_avg_pred"]],
+                    textposition="outside",
+                    cliponaxis=False,
+                    textfont=dict(size=11, color="#172033"),
+                    hovertemplate="<b>%{x}</b><br>Avg Predicted Spend: %{text}<extra></extra>",
+                ))
+                max_ry = float(reg_summary["_avg_pred"].max()) if pd.notna(reg_summary["_avg_pred"].max()) and reg_summary["_avg_pred"].max() > 0 else 1000.0
+                fig_reg = style_chart(fig_reg, h=320)
+                fig_reg.update_layout(margin=dict(l=12, r=16, t=28, b=16), showlegend=False)
+                fig_reg.update_xaxes(title_text="Region")
+                fig_reg.update_yaxes(
+                    title_text=f"Avg Predicted Spend ({CURRENCY})",
+                    tickprefix=CURRENCY,
+                    tickformat="~s",
+                    gridcolor="#e2e8f0",
+                    range=[0, max_ry * 1.28],
+                )
+                st.plotly_chart(fig_reg, use_container_width=True)
+                st.markdown("</div>", unsafe_allow_html=True)
+
+            with r_tbl_col:
+                with st.container(border=True):
+                    st.markdown('<div class="ct">📋 Regional Spending Potential Summary</div>', unsafe_allow_html=True)
+                    reg_tbl = pd.DataFrame({
+                        "Region": reg_summary["Region"],
+                        "Customers": reg_summary["Customer Count"].map(lambda x: f"{x:,}"),
+                        "Avg Predicted": reg_summary["_avg_pred"].map(lambda v: money(v) if pd.notna(v) else "N/A"),
+                        "Median Predicted": reg_summary["_med_pred"].map(lambda v: money(v) if pd.notna(v) else "N/A"),
+                        "Total Predicted": reg_summary["_tot_pred"].map(format_inr),
+                        "High-Potential": reg_summary["_hp_cnt"].map(lambda x: f"{x:,}"),
+                        "High-Potential %": reg_summary["_hp_pct"].map(lambda v: f"{v:.1f}%"),
+                    })
+                    st.dataframe(reg_tbl, hide_index=True, use_container_width=True)
+
+        st.write("")
+
+    # 8. Product Category Spending Potential
+    cat_summary = pd.DataFrame()
+    if "ProductCategory" in filtered_df.columns and filtered_df["ProductCategory"].notna().any():
+        st.markdown('<div class="sec" style="margin-bottom:8px;">Product Category Spending Potential</div>', unsafe_allow_html=True)
+        cat_summary = _build_grouped_potential_table(filtered_df, "ProductCategory", "Product Category")
+
+        if not cat_summary.empty:
+            c_chart_col, c_tbl_col = st.columns([1.15, 1.25])
+            with c_chart_col:
+                st.markdown('<div class="card"><h4>Average Predicted Annual Spending by Product Category</h4>', unsafe_allow_html=True)
+                fig_cat = go.Figure(go.Bar(
+                    x=cat_summary["Product Category"],
+                    y=cat_summary["_avg_pred"],
+                    marker_color=CAT_COLORS[: len(cat_summary)],
+                    text=[money(v) if pd.notna(v) else "N/A" for v in cat_summary["_avg_pred"]],
+                    textposition="outside",
+                    cliponaxis=False,
+                    textfont=dict(size=11, color="#172033"),
+                    hovertemplate="<b>%{x}</b><br>Avg Predicted Spend: %{text}<extra></extra>",
+                ))
+                max_cy = float(cat_summary["_avg_pred"].max()) if pd.notna(cat_summary["_avg_pred"].max()) and cat_summary["_avg_pred"].max() > 0 else 1000.0
+                fig_cat = style_chart(fig_cat, h=330)
+                fig_cat.update_layout(margin=dict(l=12, r=16, t=28, b=26), showlegend=False)
+                fig_cat.update_xaxes(
+                    title_text="Product Category",
+                    tickangle=-18 if len(cat_summary) > 5 else 0,
+                )
+                fig_cat.update_yaxes(
+                    title_text=f"Avg Predicted Spend ({CURRENCY})",
+                    tickprefix=CURRENCY,
+                    tickformat="~s",
+                    gridcolor="#e2e8f0",
+                    range=[0, max_cy * 1.28],
+                )
+                st.plotly_chart(fig_cat, use_container_width=True)
+                st.markdown("</div>", unsafe_allow_html=True)
+
+            with c_tbl_col:
+                with st.container(border=True):
+                    st.markdown('<div class="ct">📋 Product Category Spending Potential Summary</div>', unsafe_allow_html=True)
+                    cat_tbl = pd.DataFrame({
+                        "Product Category": cat_summary["Product Category"],
+                        "Customers": cat_summary["Customer Count"].map(lambda x: f"{x:,}"),
+                        "Avg Predicted": cat_summary["_avg_pred"].map(lambda v: money(v) if pd.notna(v) else "N/A"),
+                        "Median Predicted": cat_summary["_med_pred"].map(lambda v: money(v) if pd.notna(v) else "N/A"),
+                        "Total Predicted": cat_summary["_tot_pred"].map(format_inr),
+                        "High-Potential": cat_summary["_hp_cnt"].map(lambda x: f"{x:,}"),
+                        "High-Potential %": cat_summary["_hp_pct"].map(lambda v: f"{v:.1f}%"),
+                    })
+                    st.dataframe(cat_tbl, hide_index=True, use_container_width=True)
+
+        st.write("")
+
+    # 9. Customer Profile Analysis
+    st.markdown('<div class="sec" style="margin-bottom:4px;">Customer Profile Analysis</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div style="color:#475569;font-size:0.82rem;margin-bottom:8px;">'
+        'ℹ️ Descriptive demographic and behavioral associations observed across predicted spending-potential tiers.</div>',
+        unsafe_allow_html=True,
+    )
+    with st.container(border=True):
+        st.markdown('<div class="ct">🧬 Profile Comparison by Spending Potential Group</div>', unsafe_allow_html=True)
+        prof_rows = []
+        for g in pot_order:
+            sub = filtered_df[filtered_df["SpendingPotentialGroup"] == g]
+            cnt = int(len(sub))
+
+            def _mean_fmt(col_name: str, fmt_type: str) -> str:
+                if cnt == 0 or col_name not in sub.columns:
+                    return "N/A"
+                s = pd.to_numeric(sub[col_name], errors="coerce").dropna()
+                if s.empty:
+                    return "N/A"
+                val = float(s.mean())
+                if fmt_type == "money":
+                    return money(val)
+                if fmt_type == "age":
+                    return f"{val:.1f} yrs"
+                if fmt_type == "tenure":
+                    return f"{val:.2f} yrs"
+                if fmt_type == "freq":
+                    return f"{val:.1f}"
+                if fmt_type == "pct":
+                    return f"{val * 100:.1f}%"
+                return f"{val:.2f}"
+
+            prof_rows.append({
+                "Spending Potential Group": g,
+                "Customer Count": f"{cnt:,}",
+                "Average Age": _mean_fmt("Age", "age"),
+                "Average Annual Income": _mean_fmt("AnnualIncome", "money"),
+                "Average Purchase Frequency": _mean_fmt("PurchaseFrequency", "freq"),
+                "Average Customer Tenure": _mean_fmt("CustomerTenure", "tenure"),
+                "Average Return Rate": _mean_fmt("ReturnRate", "pct"),
+                "Average Predicted Annual Spending": _mean_fmt("PredictedAnnualPurchaseAmount", "money"),
+            })
+        st.dataframe(pd.DataFrame(prof_rows), hide_index=True, use_container_width=True)
+
+    st.write("")
+
+    # 10. Top Predicted Spending Customers
+    st.markdown('<div class="sec" style="margin-bottom:8px;">Top Predicted Spending Customers</div>', unsafe_allow_html=True)
+    with st.container(border=True):
+        top_hdr1, top_hdr2 = st.columns([3, 1])
+        top_hdr1.markdown('<div class="ct">🏆 Highest Predicted Spending Accounts (Prioritized Outreach)</div>', unsafe_allow_html=True)
+        top_n = top_hdr2.radio(
+            "Top N",
+            options=[10, 20],
+            horizontal=True,
+            key="sp_top_n_customers",
+            label_visibility="collapsed",
+        )
+        candidate_cols = [
+            "CustomerID",
+            "Region",
+            "ProductCategory",
+            "Age",
+            "PurchaseFrequency",
+            "AnnualIncome",
+            "PredictedAnnualPurchaseAmount",
+            "SpendingPotentialGroup",
+        ]
+        avail_top_cols = [col for col in candidate_cols if col in filtered_df.columns]
+        top_cust_df = (
+            filtered_df.sort_values(by="PredictedAnnualPurchaseAmount", ascending=False)
+            .head(top_n)[avail_top_cols]
+            .copy()
+        )
+        if "SpendingPotentialGroup" in top_cust_df.columns:
+            top_cust_df = top_cust_df.rename(columns={"SpendingPotentialGroup": "Spending Potential Group"})
+
+        top_col_cfg = {
+            "AnnualIncome": st.column_config.NumberColumn(f"Annual Income ({CURRENCY})", format=f"{CURRENCY} %,.0f"),
+            "PredictedAnnualPurchaseAmount": st.column_config.NumberColumn(
+                f"Predicted Annual Spending ({CURRENCY})", format=f"{CURRENCY} %,.0f"
+            ),
+        }
+        st.dataframe(top_cust_df, hide_index=True, use_container_width=True, column_config=top_col_cfg)
+
+    st.write("")
+
+    # 11. Dynamic Business Insights
+    st.markdown('<div class="sec" style="margin-bottom:8px;">Business Insights</div>', unsafe_allow_html=True)
+    insights = []
+
+    # High-potential cohort size & share
+    insights.append((
+        "🌟", "#fdf3df", "#fb923c",
+        f"{high_cnt:,} High-Potential Customers ({high_pct:.1f}%)",
+        f"In the current selection, {high_cnt:,} customers exceed the {money(p75_full)} predicted spending threshold "
+        f"and represent priority candidates for personalized VIP retention.",
+    ))
+
+    # Largest spending-potential group
+    if not pot_counts.empty:
+        dom_grp = str(pot_counts.index[0])
+        dom_cnt = int(pot_counts.iloc[0])
+        dom_pct = (dom_cnt / total_cust * 100.0) if total_cust > 0 else 0.0
+        insights.append((
+            "📊", "#e3f6ec", "#22c277",
+            f"Largest Tier: {dom_grp}",
+            f"{dom_grp} accounts for the largest share of the filtered cohort with {dom_cnt:,} customers ({dom_pct:.1f}%).",
+        ))
+
+    # Highest average predicted spending region
+    if not reg_summary.empty and reg_summary["_avg_pred"].notna().any():
+        top_reg = reg_summary.dropna(subset=["_avg_pred"]).iloc[0]
+        insights.append((
+            "🌍", "#e8f1fd", "#3b82f6",
+            f"Highest Regional Potential: {top_reg['Region']}",
+            f"{top_reg['Region']} records the highest average predicted annual spending at {money(top_reg['_avg_pred'])}. "
+            f"Consider investigating this region for targeted retention and premium engagement campaigns.",
+        ))
+
+        top_hp_reg = reg_summary.sort_values(by=["_hp_pct", "_hp_cnt"], ascending=[False, False]).iloc[0]
+        insights.append((
+            "📍", "#f0eafd", "#8b5cf6",
+            f"Highest High-Potential Concentration: {top_hp_reg['Region']}",
+            f"{top_hp_reg['Region']} leads all regions in high-potential customer share at {top_hp_reg['_hp_pct']:.1f}% "
+            f"({int(top_hp_reg['_hp_cnt']):,} of {int(top_hp_reg['Customer Count']):,} customers).",
+        ))
+
+    # Highest average predicted spending category & high-potential share
+    if not cat_summary.empty and cat_summary["_avg_pred"].notna().any():
+        top_cat = cat_summary.dropna(subset=["_avg_pred"]).iloc[0]
+        insights.append((
+            "🛍️", "#e0f2fe", "#0ea5e9",
+            f"Top Category Potential: {top_cat['Product Category']}",
+            f"Customers associated with {top_cat['Product Category']} show the highest average predicted annual spending at "
+            f"{money(top_cat['_avg_pred'])} ({int(top_cat['Customer Count']):,} customers).",
+        ))
+
+        top_hp_cat = cat_summary.sort_values(by=["_hp_pct", "_hp_cnt"], ascending=[False, False]).iloc[0]
+        insights.append((
+            "🎯", "#fce7f3", "#f43f5e",
+            f"Category with Highest High-Potential Share: {top_hp_cat['Product Category']}",
+            f"{top_hp_cat['Product Category']} has the highest concentration of high-potential buyers at "
+            f"{top_hp_cat['_hp_pct']:.1f}% ({int(top_hp_cat['_hp_cnt']):,} customers).",
+        ))
+
+    # Descriptive profile association for High vs Low Spending Potential
+    hp_sub = filtered_df[filtered_df["SpendingPotentialGroup"] == "High Spending Potential"]
+    lp_sub = filtered_df[filtered_df["SpendingPotentialGroup"] == "Low Spending Potential"]
+    if (
+        not hp_sub.empty
+        and not lp_sub.empty
+        and "AnnualIncome" in filtered_df.columns
+        and "PurchaseFrequency" in filtered_df.columns
+    ):
+        hp_inc = pd.to_numeric(hp_sub["AnnualIncome"], errors="coerce").mean()
+        lp_inc = pd.to_numeric(lp_sub["AnnualIncome"], errors="coerce").mean()
+        hp_frq = pd.to_numeric(hp_sub["PurchaseFrequency"], errors="coerce").mean()
+        lp_frq = pd.to_numeric(lp_sub["PurchaseFrequency"], errors="coerce").mean()
+        if pd.notna(hp_inc) and pd.notna(lp_inc) and pd.notna(hp_frq) and pd.notna(lp_frq):
+            insights.append((
+                "🧬", "#eef2ff", "#4f63e8",
+                "High-Potential Customer Profile Association",
+                f"High Spending Potential customers average {money(hp_inc)} in annual income and {hp_frq:.1f} purchases/yr, "
+                f"compared with {money(lp_inc)} and {lp_frq:.1f} purchases/yr in the Low Spending Potential tier.",
+            ))
+
+    if not insights:
+        st.info("Insufficient data in the current filter selection to generate business insights.")
+    else:
+        for row_start in range(0, len(insights), 3):
+            batch = insights[row_start : row_start + 3]
+            cols = st.columns(len(batch))
+            for idx, (icon, bg, accent, title, desc) in enumerate(batch):
+                with cols[idx]:
+                    st.markdown(
+                        f"""
+                        <div class="card" style="border-top:4px solid {accent};height:100%;">
+                            <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">
+                                <div style="width:36px;height:36px;border-radius:50%;background:{bg};
+                                            display:flex;align-items:center;justify-content:center;font-size:1.1rem;flex-shrink:0;">{icon}</div>
+                                <div style="font-size:0.9rem;font-weight:800;color:#111a3b;line-height:1.25;">{title}</div>
+                            </div>
+                            <div style="font-size:0.78rem;color:#475569;line-height:1.45;">{desc}</div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+
+
+def render_spending_prediction():
+    """Renders the redesigned Spending Prediction page with cohort filters, regional/category comparisons, accuracy metrics, and insights."""
+    st.markdown(
+        '<div class="welcome">Spending <span style="color:#4f63e8">Prediction</span></div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        '<div class="tagline">Actual vs. predicted annual spending across regions and product categories '
+        '&nbsp;•&nbsp; Powered by pre-trained HistGradientBoosting regression</div>',
         unsafe_allow_html=True,
     )
 
@@ -539,335 +1227,428 @@ def render_spending_prediction():
         else list(SPENDING_FEATURES)
     )
 
-    # ---------------- B. INDIVIDUAL CUSTOMER PREDICTION ----------------
-    with st.container(border=True):
-        st.markdown('<div class="ct">🧮 Individual Customer Prediction</div>', unsafe_allow_html=True)
+    work_df = _resolve_recency_column(raw.copy())
 
-        def _col_median(col_name: str, fallback: float) -> float:
-            if col_name in raw.columns:
-                s = pd.to_numeric(raw[col_name], errors="coerce").dropna()
-                if not s.empty:
-                    return float(s.median())
-            return fallback
+    # Convert CustomerTenureMonths -> CustomerTenure (in years) if CustomerTenure is absent
+    if "CustomerTenure" not in work_df.columns and "CustomerTenureMonths" in work_df.columns:
+        work_df["CustomerTenure"] = pd.to_numeric(work_df["CustomerTenureMonths"], errors="coerce") / 12.0
 
-        with st.form("individual_spending_form"):
-            r1c1, r1c2, r1c3 = st.columns(3)
-            with r1c1:
-                in_freq = st.number_input(
-                    "Purchase Frequency (orders/yr)",
-                    min_value=0.0,
-                    max_value=500.0,
-                    value=round(_col_median("PurchaseFrequency", 6.0), 1),
-                    step=1.0,
-                )
-            with r1c2:
-                in_income = st.number_input(
-                    f"Annual Income ({CURRENCY})",
-                    min_value=0.0,
-                    max_value=50_000_000.0,
-                    value=round(_col_median("AnnualIncome", 60000.0), 2),
-                    step=1000.0,
-                )
-            with r1c3:
-                in_recency = st.number_input(
-                    "Recency (days since last purchase)",
-                    min_value=0,
-                    max_value=3650,
-                    value=int(round(_col_median("Recency", 45.0))),
-                    step=1,
-                )
+    # Case/space-insensitive column matching for remaining features
+    norm_col_map = {c.lower().replace(" ", "").replace("_", ""): c for c in work_df.columns}
+    missing_cols = []
+    feat_df = pd.DataFrame(index=work_df.index)
 
-            r2c1, r2c2, r2c3 = st.columns(3)
-            with r2c1:
-                in_tenure = st.number_input(
-                    "Customer Tenure (years)",
-                    min_value=0.0,
-                    max_value=100.0,
-                    value=round(_col_median("CustomerTenure", 3.5), 2),
-                    step=0.5,
-                )
-            with r2c2:
-                in_return = st.number_input(
-                    "Return Rate (0.00 – 1.00)",
-                    min_value=0.0,
-                    max_value=1.0,
-                    value=round(min(max(_col_median("ReturnRate", 0.08), 0.0), 1.0), 4),
-                    step=0.01,
-                    format="%.4f",
-                )
-            with r2c3:
-                in_age = st.number_input(
-                    "Age (years)",
-                    min_value=18,
-                    max_value=110,
-                    value=int(round(min(max(_col_median("Age", 35.0), 18), 110))),
-                    step=1,
-                )
-
-            submitted = st.form_submit_button("Predict Annual Spending")
-
-        if submitted:
-            input_values = {
-                "PurchaseFrequency": in_freq,
-                "AnnualIncome": in_income,
-                "Recency": in_recency,
-                "CustomerTenure": in_tenure,
-                "ReturnRate": in_return,
-                "Age": in_age,
-            }
-            if any(v is None or pd.isna(v) for v in input_values.values()):
-                st.error("❌ All 6 input fields are required and must contain valid numeric values.")
-            elif in_income <= 0:
-                st.error("❌ Annual Income must be greater than ₹ 0.")
+    for feat in expected_features:
+        if feat in work_df.columns:
+            feat_df[feat] = pd.to_numeric(work_df[feat], errors="coerce")
+        else:
+            matched = norm_col_map.get(feat.lower().replace(" ", "").replace("_", ""))
+            if matched is not None:
+                feat_df[feat] = pd.to_numeric(work_df[matched], errors="coerce")
             else:
-                single_df = pd.DataFrame([input_values])[expected_features]
-                pred_single = float(reg_model.predict(single_df)[0])
-                pred_single = max(0.0, pred_single)
-                st.markdown(
-                    f"""
-                    <div style="background:#eef2ff;border-left:4px solid #4f63e8;border-radius:10px;
-                                padding:14px 18px;margin-top:8px;display:flex;justify-content:space-between;align-items:center;">
-                        <div>
-                            <div style="font-size:0.78rem;color:#475569;font-weight:600;">ESTIMATED ANNUAL SPENDING</div>
-                            <div style="font-size:1.65rem;font-weight:800;color:#111a3b;">{format_inr(pred_single)}</div>
-                        </div>
-                        <div style="font-size:0.78rem;color:#475569;text-align:right;">
-                            Exact Value: <b>{CURRENCY} {pred_single:,.2f}</b><br>
-                            Pipeline: HistGradientBoostingRegressor
-                        </div>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
+                missing_cols.append(feat)
+                feat_df[feat] = np.nan
 
-    st.write("")
-
-    # ---------------- DATASET FEATURE VALIDATION & BATCH PREDICTION ----------------
-    missing_cols = [col for col in expected_features if col not in raw.columns]
-    if missing_cols:
+    if len(missing_cols) == len(expected_features) or feat_df.isna().all().all():
         st.warning(
-            f"⚠️ Dataset-level prediction skipped because required model feature(s) are missing from "
-            f"**{source_name}**: **{', '.join(missing_cols)}**. Expected features: `{expected_features}`."
+            f"⚠️ Cannot run Spending Prediction because none of the required model features "
+            f"(`{expected_features}`) are available in **{source_name}**."
         )
         return
 
-    # Preserve all customer rows; coerce features to numeric and let pipeline SimpleImputer handle nulls
-    work_df = raw.copy()
-    feat_df = pd.DataFrame(index=work_df.index)
-    for feat in expected_features:
-        feat_df[feat] = pd.to_numeric(work_df[feat], errors="coerce")
+    if missing_cols:
+        st.info(
+            f"ℹ️ **{source_name}** is missing **{', '.join(missing_cols)}**. "
+            f"Using the saved regression pipeline's built-in median imputer for those feature(s)."
+        )
 
     if feat_df.isna().all().all():
-        st.warning("⚠️ None of the required model features contain valid numeric values in the active dataset.")
+        st.warning("⚠️ None of the six required model features contain valid numeric values in the active dataset.")
         return
 
-    # Apply Top Search Filter if typed
+    work_df["PredictedAnnualPurchaseAmount"] = reg_model.predict(feat_df[expected_features])
+    work_df["_actual_spend"] = (
+        pd.to_numeric(work_df["AnnualPurchaseAmount"], errors="coerce")
+        if "AnnualPurchaseAmount" in work_df.columns
+        else np.nan
+    )
+
     q = st.session_state.get("search", "").strip().lower()
     if q:
         search_cols = [c for c in ["CustomerID", "Region", "Gender", "ProductCategory"] if c in work_df.columns]
         if search_cols:
             mask = work_df[search_cols].astype(str).apply(lambda s: s.str.lower().str.contains(q)).any(axis=1)
             work_df = work_df.loc[mask].copy()
-            feat_df = feat_df.loc[mask].copy()
             if work_df.empty:
                 st.warning(f"No customers match “{q}”.")
                 return
 
-    preds = np.clip(reg_model.predict(feat_df[expected_features]), 0.0, None)
-    work_df["PredictedAnnualSpending"] = preds
-
-    has_actual = "AnnualPurchaseAmount" in work_df.columns
-    if has_actual:
-        work_df["_actual_spend"] = pd.to_numeric(work_df["AnnualPurchaseAmount"], errors="coerce")
-        has_actual = bool(work_df["_actual_spend"].notna().any())
-
-    # ---------------- A. PREDICTION OVERVIEW (4 KPI CARDS) ----------------
-    st.markdown('<div class="sec" style="margin-bottom:8px;">Prediction Overview</div>', unsafe_allow_html=True)
-    total_cust = len(work_df)
-    avg_pred = float(np.mean(preds))
-
-    c = st.columns(4)
-    kpi(c[0], "👥", "Total Customers", f"{total_cust:,}", "Active cohort evaluated", "#e8f1fd")
-
-    if has_actual:
-        valid_comp = work_df.dropna(subset=["_actual_spend"])
-        avg_actual = float(valid_comp["_actual_spend"].mean())
-        avg_diff = float((valid_comp["PredictedAnnualSpending"] - valid_comp["_actual_spend"]).mean())
-        mae_val = float((valid_comp["PredictedAnnualSpending"] - valid_comp["_actual_spend"]).abs().mean())
-        diff_sign = "+" if avg_diff >= 0 else "-"
-
-        kpi(c[1], "🧾", "Avg. Actual Spend", money(avg_actual), f"Across {len(valid_comp):,} actual records", "#e3f6ec")
-        kpi(c[2], "📈", "Avg. Predicted Spend", money(avg_pred), f"Median {money(float(np.median(preds)))}", "#f0eafd")
-        kpi(
-            c[3],
-            "⚖️",
-            "Avg. Prediction Diff",
-            f"{diff_sign}{CURRENCY} {abs(avg_diff):,.0f}",
-            f"Mean Abs Error: {money(mae_val)}",
-            "#fdf3df",
-        )
-    else:
-        kpi(c[1], "🧾", "Avg. Actual Spend", "N/A", "Actual target column absent", "#e3f6ec")
-        kpi(c[2], "📈", "Avg. Predicted Spend", money(avg_pred), f"Median {money(float(np.median(preds)))}", "#f0eafd")
-        kpi(c[3], "⚖️", "Avg. Prediction Diff", "N/A", "Requires AnnualPurchaseAmount", "#fdf3df")
+    # ---------------- 3. COHORT FILTERS (Region, Age Group, Product Category) ----------------
+    filtered_df = _apply_spending_filters(work_df)
+    if filtered_df.empty:
+        st.warning("⚠️ No customers match the selected filters. Clear one or more filters to view spending analysis.")
+        return
 
     st.write("")
 
-    # ---------------- C. PREDICTION ANALYSIS (PLOTLY CHARTS + SUMMARY) ----------------
-    st.markdown('<div class="sec" style="margin-bottom:8px;">Prediction Analysis</div>', unsafe_allow_html=True)
-    ch1, ch2 = st.columns(2)
+    # ---------------- 4. FOUR KPI CARDS ----------------
+    total_cust = int(len(filtered_df))
+    valid_act = filtered_df["_actual_spend"].dropna()
+    valid_pred = filtered_df["PredictedAnnualPurchaseAmount"].dropna()
+    valid_both = filtered_df.dropna(subset=["_actual_spend", "PredictedAnnualPurchaseAmount"])
 
-    with ch1:
-        st.markdown('<div class="card"><h4>Predicted Annual Spending Distribution</h4>', unsafe_allow_html=True)
-        hist_sample = (
-            work_df["PredictedAnnualSpending"].sample(min(50_000, len(work_df)), random_state=42)
-        )
-        fig_hist = px.histogram(
-            hist_sample,
-            x="PredictedAnnualSpending",
-            nbins=30,
-            color_discrete_sequence=["#4f63e8"],
-        )
-        fig_hist.add_vline(
-            x=avg_pred,
-            line_dash="dash",
-            line_color="#22c277",
-            line_width=2,
-            annotation_text=f"Mean: {money(avg_pred)}",
-            annotation_position="top right",
-            annotation_font=dict(size=11, color="#172033"),
-        )
-        fig_hist.update_xaxes(title_text=f"Predicted Annual Spend ({CURRENCY})", tickprefix=CURRENCY, tickformat="~s")
-        fig_hist.update_yaxes(title_text="Customer Count", gridcolor="#e2e8f0")
-        fig_hist.update_traces(
-            marker_line_width=1,
-            marker_line_color="#3b82f6",
-            hovertemplate="<b>Range:</b> %{x}<br><b>Customers:</b> %{y:,}<extra></extra>",
-        )
-        st.plotly_chart(style_chart(fig_hist, h=320), use_container_width=True)
-        st.markdown("</div>", unsafe_allow_html=True)
+    avg_actual_txt = money(float(valid_act.mean())) if not valid_act.empty else "N/A"
+    avg_actual_sub = f"Across {len(valid_act):,} observed records" if not valid_act.empty else "No actual spend values"
 
-    with ch2:
-        if has_actual:
-            st.markdown('<div class="card"><h4>Actual vs. Predicted Annual Spending</h4>', unsafe_allow_html=True)
-            comp_df = work_df.dropna(subset=["_actual_spend"])[["_actual_spend", "PredictedAnnualSpending"]].copy()
-            comp_sample = comp_df.sample(min(4000, len(comp_df)), random_state=42)
-            low_v = float(min(comp_sample["_actual_spend"].min(), comp_sample["PredictedAnnualSpending"].min()))
-            high_v = float(max(comp_sample["_actual_spend"].max(), comp_sample["PredictedAnnualSpending"].max()))
+    avg_pred_txt = money(float(valid_pred.mean())) if not valid_pred.empty else "N/A"
+    avg_pred_sub = (
+        f"Median {money(float(valid_pred.median()))} (model output)"
+        if not valid_pred.empty
+        else "No predictions available"
+    )
 
-            fig_scat = go.Figure()
-            fig_scat.add_trace(
-                go.Scattergl(
-                    x=comp_sample["_actual_spend"],
-                    y=comp_sample["PredictedAnnualSpending"],
-                    mode="markers",
-                    name="Customers",
-                    marker=dict(color="#3b82f6", size=5, opacity=0.45),
-                    hovertemplate=f"<b>Actual:</b> {CURRENCY}%{{x:,.0f}}<br><b>Predicted:</b> {CURRENCY}%{{y:,.0f}}<extra></extra>",
-                )
-            )
-            fig_scat.add_trace(
-                go.Scatter(
-                    x=[low_v, high_v],
-                    y=[low_v, high_v],
-                    mode="lines",
-                    name="Ideal Fit (y = x)",
-                    line=dict(color="#fb923c", width=2, dash="dash"),
-                )
-            )
-            fig_scat.update_xaxes(title_text=f"Actual Annual Spend ({CURRENCY})", tickprefix=CURRENCY, tickformat="~s", gridcolor="#e2e8f0")
-            fig_scat.update_yaxes(title_text=f"Predicted Annual Spend ({CURRENCY})", tickprefix=CURRENCY, tickformat="~s", gridcolor="#e2e8f0")
-            fig_scat.update_layout(legend=dict(orientation="h", x=0, y=1.08))
-            st.plotly_chart(style_chart(fig_scat, h=320), use_container_width=True)
-            st.markdown("</div>", unsafe_allow_html=True)
-        else:
-            st.markdown('<div class="card"><h4>Predicted Spending Brackets</h4>', unsafe_allow_html=True)
-            p_bins = pd.qcut(work_df["PredictedAnnualSpending"], q=4, duplicates="drop")
-            b_labels = [f"{CURRENCY}{int(iv.left):,}–{int(iv.right):,}" for iv in p_bins.cat.categories]
-            b_counts = p_bins.cat.rename_categories(b_labels).value_counts().sort_index()
-            fig_brk = go.Figure(
-                go.Bar(
-                    x=b_counts.index.astype(str),
-                    y=b_counts.values,
-                    marker_color=PALETTE[: len(b_counts)],
-                    text=[f"{v:,}" for v in b_counts.values],
-                    textposition="outside",
-                    cliponaxis=False,
-                    textfont=dict(size=11, color="#172033"),
-                )
-            )
-            fig_brk.update_yaxes(range=[0, b_counts.max() * 1.25], gridcolor="#e2e8f0", title_text="Customers")
-            st.plotly_chart(style_chart(fig_brk, h=320), use_container_width=True)
-            st.markdown("</div>", unsafe_allow_html=True)
-
-    # Prediction Summary Strip
-    p25, p50, p75 = np.percentile(preds, [25, 50, 75])
-    if has_actual:
-        valid_r2 = work_df.dropna(subset=["_actual_spend"])
-        ss_res = float(((valid_r2["_actual_spend"] - valid_r2["PredictedAnnualSpending"]) ** 2).sum())
-        ss_tot = float(((valid_r2["_actual_spend"] - valid_r2["_actual_spend"].mean()) ** 2).sum())
-        r2_val = 1.0 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
-        summary_html = (
-            f"<b>Prediction Summary:</b> Across <b>{total_cust:,}</b> customers, predicted annual spending spans an "
-            f"interquartile range of <b>{money(p25)}</b> (25th) to <b>{money(p75)}</b> (75th) with a median of "
-            f"<b>{money(p50)}</b>. Against observed `AnnualPurchaseAmount` values, the model achieves an "
-            f"<b>R² of {r2_val:.4f}</b> and a mean absolute error of <b>{money(mae_val)}</b>."
-        )
+    if not valid_both.empty:
+        abs_errors = (valid_both["_actual_spend"] - valid_both["PredictedAnnualPurchaseAmount"]).abs()
+        mae_kpi_txt = money(float(abs_errors.mean()))
+        mae_kpi_sub = f"Avg |Actual − Predicted| ({len(valid_both):,} rows)"
     else:
-        summary_html = (
-            f"<b>Prediction Summary:</b> Across <b>{total_cust:,}</b> customers, predicted annual spending spans an "
-            f"interquartile range of <b>{money(p25)}</b> (25th) to <b>{money(p75)}</b> (75th) with a median of "
-            f"<b>{money(p50)}</b>."
-        )
+        mae_kpi_txt = "N/A"
+        mae_kpi_sub = "Requires actual & predicted values"
+
+    c = st.columns(4)
+    kpi(c[0], "👥", "Total Customers", f"{total_cust:,}", "Filtered cohort size", "#e8f1fd")
+    kpi(c[1], "🧾", "Avg. Actual Annual Spending", avg_actual_txt, avg_actual_sub, "#e3f6ec")
+    kpi(c[2], "📈", "Avg. Predicted Annual Spending", avg_pred_txt, avg_pred_sub, "#f0eafd")
+    kpi(c[3], "🎯", "Mean Absolute Prediction Error", mae_kpi_txt, mae_kpi_sub, "#fdf3df")
+
+    st.write("")
+
+    # ---------------- 5. REGIONAL SPENDING ANALYSIS ----------------
+    reg_summary = pd.DataFrame()
+    if "Region" in filtered_df.columns and filtered_df["Region"].notna().any():
+        st.markdown('<div class="sec" style="margin-bottom:8px;">Regional Spending Analysis</div>', unsafe_allow_html=True)
+        reg_summary = _build_grouped_spending_table(filtered_df, "Region", "Region")
+
+        if not reg_summary.empty:
+            reg_col_chart, reg_col_tbl = st.columns([1.25, 1])
+
+            with reg_col_chart:
+                st.markdown('<div class="card"><h4>Actual vs Predicted Annual Spending by Region</h4>', unsafe_allow_html=True)
+                fig_reg = go.Figure()
+                fig_reg.add_trace(
+                    go.Bar(
+                        name="Average Actual Spending",
+                        x=reg_summary["Region"],
+                        y=reg_summary["_avg_actual"],
+                        marker_color="#22c277",
+                        text=[money(v) if pd.notna(v) else "N/A" for v in reg_summary["_avg_actual"]],
+                        textposition="outside",
+                        cliponaxis=False,
+                        textfont=dict(size=10, color="#172033"),
+                        hovertemplate="<b>%{x}</b><br>Avg Actual: %{text}<extra></extra>",
+                    )
+                )
+                fig_reg.add_trace(
+                    go.Bar(
+                        name="Average Predicted Spending",
+                        x=reg_summary["Region"],
+                        y=reg_summary["_avg_pred"],
+                        marker_color="#3b82f6",
+                        text=[money(v) if pd.notna(v) else "N/A" for v in reg_summary["_avg_pred"]],
+                        textposition="outside",
+                        cliponaxis=False,
+                        textfont=dict(size=10, color="#172033"),
+                        hovertemplate="<b>%{x}</b><br>Avg Predicted: %{text}<extra></extra>",
+                    )
+                )
+                max_reg_y = float(
+                    np.nanmax([reg_summary["_avg_actual"].max(), reg_summary["_avg_pred"].max()])
+                )
+                max_reg_y = max_reg_y if pd.notna(max_reg_y) and max_reg_y > 0 else 1000.0
+                fig_reg = style_chart(fig_reg, h=330)
+                fig_reg.update_layout(
+                    barmode="group",
+                    bargap=0.22,
+                    bargroupgap=0.08,
+                    margin=dict(l=12, r=16, t=44, b=16),
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+                )
+                fig_reg.update_xaxes(title_text="Region")
+                fig_reg.update_yaxes(
+                    title_text=f"Average Annual Spending ({CURRENCY})",
+                    tickprefix=CURRENCY,
+                    tickformat="~s",
+                    gridcolor="#e2e8f0",
+                    range=[0, max_reg_y * 1.28],
+                )
+                st.plotly_chart(fig_reg, use_container_width=True)
+                st.markdown("</div>", unsafe_allow_html=True)
+
+            with reg_col_tbl:
+                with st.container(border=True):
+                    st.markdown('<div class="ct">📋 Regional Summary</div>', unsafe_allow_html=True)
+                    reg_display = pd.DataFrame({
+                        "Region": reg_summary["Region"],
+                        "Customer Count": reg_summary["Customer Count"].map(lambda x: f"{x:,}"),
+                        "Avg Actual Spending": reg_summary["_avg_actual"].map(lambda v: money(v) if pd.notna(v) else "N/A"),
+                        "Avg Predicted Spending": reg_summary["_avg_pred"].map(lambda v: money(v) if pd.notna(v) else "N/A"),
+                        "Mean Absolute Error": reg_summary["_mae"].map(lambda v: money(v) if pd.notna(v) else "N/A"),
+                    })
+                    st.dataframe(reg_display, hide_index=True, use_container_width=True)
+
+        st.write("")
+
+    # ---------------- 6. PRODUCT CATEGORY SPENDING ANALYSIS ----------------
+    cat_summary = pd.DataFrame()
+    if "ProductCategory" in filtered_df.columns and filtered_df["ProductCategory"].notna().any():
+        st.markdown('<div class="sec" style="margin-bottom:8px;">Product Category Spending Analysis</div>', unsafe_allow_html=True)
+        cat_summary = _build_grouped_spending_table(filtered_df, "ProductCategory", "Product Category")
+
+        if not cat_summary.empty:
+            cat_col_chart, cat_col_tbl = st.columns([1.25, 1])
+
+            with cat_col_chart:
+                st.markdown(
+                    '<div class="card"><h4>Actual vs Predicted Annual Spending by Product Category</h4>',
+                    unsafe_allow_html=True,
+                )
+                fig_cat = go.Figure()
+                fig_cat.add_trace(
+                    go.Bar(
+                        name="Average Actual Spending",
+                        x=cat_summary["Product Category"],
+                        y=cat_summary["_avg_actual"],
+                        marker_color="#22c277",
+                        text=[money(v) if pd.notna(v) else "N/A" for v in cat_summary["_avg_actual"]],
+                        textposition="outside",
+                        cliponaxis=False,
+                        textfont=dict(size=10, color="#172033"),
+                        hovertemplate="<b>%{x}</b><br>Avg Actual: %{text}<extra></extra>",
+                    )
+                )
+                fig_cat.add_trace(
+                    go.Bar(
+                        name="Average Predicted Spending",
+                        x=cat_summary["Product Category"],
+                        y=cat_summary["_avg_pred"],
+                        marker_color="#4f63e8",
+                        text=[money(v) if pd.notna(v) else "N/A" for v in cat_summary["_avg_pred"]],
+                        textposition="outside",
+                        cliponaxis=False,
+                        textfont=dict(size=10, color="#172033"),
+                        hovertemplate="<b>%{x}</b><br>Avg Predicted: %{text}<extra></extra>",
+                    )
+                )
+                max_cat_y = float(
+                    np.nanmax([cat_summary["_avg_actual"].max(), cat_summary["_avg_pred"].max()])
+                )
+                max_cat_y = max_cat_y if pd.notna(max_cat_y) and max_cat_y > 0 else 1000.0
+                fig_cat = style_chart(fig_cat, h=340)
+                fig_cat.update_layout(
+                    barmode="group",
+                    bargap=0.22,
+                    bargroupgap=0.08,
+                    margin=dict(l=12, r=16, t=44, b=28),
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+                )
+                fig_cat.update_xaxes(
+                    title_text="Product Category",
+                    tickangle=-18 if len(cat_summary) > 5 else 0,
+                )
+                fig_cat.update_yaxes(
+                    title_text=f"Average Annual Spending ({CURRENCY})",
+                    tickprefix=CURRENCY,
+                    tickformat="~s",
+                    gridcolor="#e2e8f0",
+                    range=[0, max_cat_y * 1.28],
+                )
+                st.plotly_chart(fig_cat, use_container_width=True)
+                st.markdown("</div>", unsafe_allow_html=True)
+
+            with cat_col_tbl:
+                with st.container(border=True):
+                    st.markdown('<div class="ct">📋 Category Summary</div>', unsafe_allow_html=True)
+                    cat_display = pd.DataFrame({
+                        "Product Category": cat_summary["Product Category"],
+                        "Customer Count": cat_summary["Customer Count"].map(lambda x: f"{x:,}"),
+                        "Avg Actual Spending": cat_summary["_avg_actual"].map(lambda v: money(v) if pd.notna(v) else "N/A"),
+                        "Avg Predicted Spending": cat_summary["_avg_pred"].map(lambda v: money(v) if pd.notna(v) else "N/A"),
+                        "Mean Absolute Error": cat_summary["_mae"].map(lambda v: money(v) if pd.notna(v) else "N/A"),
+                    })
+                    st.dataframe(cat_display, hide_index=True, use_container_width=True)
+
+        st.write("")
+
+    # ---------------- 7. PREDICTION ACCURACY ANALYSIS ----------------
+    st.markdown('<div class="sec" style="margin-bottom:4px;">Prediction Accuracy Analysis</div>', unsafe_allow_html=True)
     st.markdown(
-        f'<div class="card" style="font-size:0.84rem;color:#334155;">{summary_html}</div>',
+        '<div style="color:#475569;font-size:0.82rem;margin-bottom:10px;">'
+        'ℹ️ These evaluation metrics measure <b>regression model accuracy</b> on the filtered cohort '
+        '(comparing predicted vs. observed <code>AnnualPurchaseAmount</code>), not customer revenue.</div>',
         unsafe_allow_html=True,
     )
 
+    if valid_both.empty:
+        st.info("Actual `AnnualPurchaseAmount` values are unavailable in this dataset, so error metrics cannot be computed.")
+    else:
+        y_true = valid_both["_actual_spend"].to_numpy(dtype=float)
+        y_hat = valid_both["PredictedAnnualPurchaseAmount"].to_numpy(dtype=float)
+        err_diff = y_true - y_hat
+
+        mae_score = float(np.mean(np.abs(err_diff)))
+        rmse_score = float(np.sqrt(np.mean(err_diff ** 2)))
+
+        if len(y_true) >= 2 and float(np.var(y_true)) > 1e-12:
+            ss_res = float(np.sum(err_diff ** 2))
+            ss_tot = float(np.sum((y_true - np.mean(y_true)) ** 2))
+            r2_txt = f"{1.0 - (ss_res / ss_tot):.4f}"
+            r2_sub = f"Variance explained ({len(y_true):,} samples)"
+        else:
+            r2_txt = "N/A"
+            r2_sub = "Requires ≥ 2 samples with spend variance"
+
+        acc_left, acc_right = st.columns([1, 1.35])
+        with acc_left:
+            with st.container(border=True):
+                st.markdown('<div class="ct">📐 Model Evaluation Metrics</div>', unsafe_allow_html=True)
+                st.markdown(
+                    f"""
+                    <div style="display:grid;grid-template-columns:1fr;gap:10px;margin-top:6px;">
+                        <div style="background:#f8f9fc;border-left:4px solid #3b82f6;border-radius:8px;padding:10px 14px;">
+                            <div style="font-size:0.72rem;color:#475569;font-weight:700;">MAE (MEAN ABSOLUTE ERROR)</div>
+                            <div style="font-size:1.35rem;font-weight:800;color:#111a3b;">{money(mae_score)}</div>
+                            <div style="font-size:0.72rem;color:#64748b;">Average absolute rupee deviation per customer</div>
+                        </div>
+                        <div style="background:#f8f9fc;border-left:4px solid #8b5cf6;border-radius:8px;padding:10px 14px;">
+                            <div style="font-size:0.72rem;color:#475569;font-weight:700;">RMSE (ROOT MEAN SQUARED ERROR)</div>
+                            <div style="font-size:1.35rem;font-weight:800;color:#111a3b;">{money(rmse_score)}</div>
+                            <div style="font-size:0.72rem;color:#64748b;">Penalizes large outlier spending errors</div>
+                        </div>
+                        <div style="background:#f8f9fc;border-left:4px solid #22c277;border-radius:8px;padding:10px 14px;">
+                            <div style="font-size:0.72rem;color:#475569;font-weight:700;">R² SCORE (COEFFICIENT OF DETERMINATION)</div>
+                            <div style="font-size:1.35rem;font-weight:800;color:#111a3b;">{r2_txt}</div>
+                            <div style="font-size:0.72rem;color:#64748b;">{r2_sub}</div>
+                        </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+        with acc_right:
+            err_df = cat_summary if not cat_summary.empty else reg_summary
+            err_dim = "Product Category" if not cat_summary.empty else "Region"
+            if not err_df.empty and err_df["_mae"].notna().any():
+                err_sorted = err_df.dropna(subset=["_mae"]).sort_values("_mae", ascending=False)
+                st.markdown(
+                    f'<div class="card"><h4>Mean Absolute Prediction Error by {err_dim}</h4>',
+                    unsafe_allow_html=True,
+                )
+                fig_err = go.Figure(
+                    go.Bar(
+                        x=err_sorted[err_dim],
+                        y=err_sorted["_mae"],
+                        marker_color="#fb923c",
+                        text=[money(v) for v in err_sorted["_mae"]],
+                        textposition="outside",
+                        cliponaxis=False,
+                        textfont=dict(size=11, color="#172033"),
+                        hovertemplate="<b>%{x}</b><br>MAE: %{text}<extra></extra>",
+                    )
+                )
+                max_err_y = float(err_sorted["_mae"].max()) if err_sorted["_mae"].max() > 0 else 1000.0
+                fig_err = style_chart(fig_err, h=305)
+                fig_err.update_layout(margin=dict(l=12, r=16, t=28, b=24), showlegend=False)
+                fig_err.update_xaxes(
+                    title_text=err_dim,
+                    tickangle=-18 if len(err_sorted) > 5 else 0,
+                )
+                fig_err.update_yaxes(
+                    title_text=f"Mean Absolute Error ({CURRENCY})",
+                    tickprefix=CURRENCY,
+                    tickformat="~s",
+                    gridcolor="#e2e8f0",
+                    range=[0, max_err_y * 1.28],
+                )
+                st.plotly_chart(fig_err, use_container_width=True)
+                st.markdown("</div>", unsafe_allow_html=True)
+            else:
+                st.info("Insufficient regional or category breakdown to plot prediction error.")
+
     st.write("")
 
-    # ---------------- D. CUSTOMER PREDICTION RESULTS TABLE ----------------
-    with st.container(border=True):
-        st.markdown('<div class="ct">📋 Customer Prediction Results</div>', unsafe_allow_html=True)
-        t_col1, t_col2 = st.columns([1.2, 2.8])
-        with t_col1:
-            row_limit = st.selectbox(
-                "Rows to display",
-                options=[25, 100, 500, 1000],
-                index=1,
-                key="pred_table_limit",
-            )
-        with t_col2:
-            st.markdown(
-                f'<div style="color:#475569;font-size:0.8rem;padding-top:30px;">'
-                f'Showing top <b>{min(row_limit, total_cust):,}</b> of <b>{total_cust:,}</b> customers '
-                f'(all rows preserved, including imputed feature nulls).</div>',
-                unsafe_allow_html=True,
-            )
+    # ---------------- 8. DYNAMIC BUSINESS INSIGHTS ----------------
+    st.markdown('<div class="sec" style="margin-bottom:8px;">Business Insights</div>', unsafe_allow_html=True)
+    insight_cards = []
 
-        display_cols = []
-        if "CustomerID" in work_df.columns:
-            display_cols.append("CustomerID")
-        for feat in expected_features:
-            if feat in work_df.columns:
-                display_cols.append(feat)
+    if not reg_summary.empty and reg_summary["_avg_actual"].notna().any():
+        top_reg_row = reg_summary.dropna(subset=["_avg_actual"]).iloc[0]
+        insight_cards.append((
+            "🌍", "#e8f1fd", "#3b82f6",
+            f"Highest-Spending Region: {top_reg_row['Region']}",
+            f"Customers in {top_reg_row['Region']} record the highest average actual annual spend at "
+            f"{money(top_reg_row['_avg_actual'])} (vs. {money(top_reg_row['_avg_pred'])} predicted).",
+        ))
 
-        table_df = work_df[display_cols].head(row_limit).copy()
-        if has_actual:
-            table_df["ActualAnnualPurchaseAmount"] = work_df["_actual_spend"].head(row_limit).round(2)
-        table_df["PredictedAnnualSpending"] = work_df["PredictedAnnualSpending"].head(row_limit).round(2)
-        if has_actual:
-            table_df["Difference (Pred - Actual)"] = (
-                table_df["PredictedAnnualSpending"] - table_df["ActualAnnualPurchaseAmount"]
-            ).round(2)
+    if not reg_summary.empty and reg_summary["_mae"].notna().any():
+        worst_reg_row = reg_summary.dropna(subset=["_mae"]).sort_values("_mae", ascending=False).iloc[0]
+        insight_cards.append((
+            "⚠️", "#fdf3df", "#fb923c",
+            f"Largest Regional Prediction Error: {worst_reg_row['Region']}",
+            f"{worst_reg_row['Region']} shows the highest MAE at {money(worst_reg_row['_mae'])} across "
+            f"{int(worst_reg_row['Customer Count']):,} customers, indicating higher spending variance.",
+        ))
 
-        col_cfg = {
-            "AnnualIncome": st.column_config.NumberColumn(f"Annual Income ({CURRENCY})", format=f"{CURRENCY} %.2f"),
-            "ActualAnnualPurchaseAmount": st.column_config.NumberColumn(f"Actual Spend ({CURRENCY})", format=f"{CURRENCY} %.2f"),
-            "PredictedAnnualSpending": st.column_config.NumberColumn(f"Predicted Spend ({CURRENCY})", format=f"{CURRENCY} %.2f"),
-            "Difference (Pred - Actual)": st.column_config.NumberColumn(f"Difference ({CURRENCY})", format=f"{CURRENCY} %.2f"),
-        }
-        st.dataframe(table_df, hide_index=True, use_container_width=True, column_config=col_cfg)            
+    if not cat_summary.empty and cat_summary["_avg_actual"].notna().any():
+        top_cat_row = cat_summary.dropna(subset=["_avg_actual"]).iloc[0]
+        insight_cards.append((
+            "🛍️", "#e3f6ec", "#22c277",
+            f"Top-Spending Category: {top_cat_row['Product Category']}",
+            f"{top_cat_row['Product Category']} leads all categories with {money(top_cat_row['_avg_actual'])} "
+            f"in average actual annual spending ({int(top_cat_row['Customer Count']):,} customers).",
+        ))
+
+    if not cat_summary.empty and cat_summary["_bias"].notna().any():
+        valid_bias = cat_summary.dropna(subset=["_bias"])
+        over_cats = valid_bias[valid_bias["_bias"] > 0].sort_values("_bias", ascending=False)
+        if not over_cats.empty:
+            r_over = over_cats.iloc[0]
+            insight_cards.append((
+                "📈", "#f0eafd", "#8b5cf6",
+                f"Predicted Above Actual: {r_over['Product Category']}",
+                f"Model predictions for {r_over['Product Category']} ({money(r_over['_avg_pred'])}) exceed "
+                f"actual spending ({money(r_over['_avg_actual'])}) by {money(r_over['_bias'])} on average.",
+            ))
+        under_cats = valid_bias[valid_bias["_bias"] < 0].sort_values("_bias", ascending=True)
+        if not under_cats.empty:
+            r_under = under_cats.iloc[0]
+            insight_cards.append((
+                "📉", "#fce7f3", "#f43f5e",
+                f"Predicted Below Actual: {r_under['Product Category']}",
+                f"Actual spending in {r_under['Product Category']} ({money(r_under['_avg_actual'])}) outpaces "
+                f"model predictions ({money(r_under['_avg_pred'])}) by {money(abs(r_under['_bias']))} on average.",
+            ))
+
+    if not insight_cards:
+        st.info("Insufficient regional, category, or actual spending data in the current filter selection to generate insights.")
+    else:
+        for row_start in range(0, len(insight_cards), 3):
+            batch = insight_cards[row_start : row_start + 3]
+            cols = st.columns(len(batch))
+            for idx, (icon, bg, accent, title, desc) in enumerate(batch):
+                with cols[idx]:
+                    st.markdown(
+                        f"""
+                        <div class="card" style="border-top:4px solid {accent};height:100%;">
+                            <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">
+                                <div style="width:36px;height:36px;border-radius:50%;background:{bg};
+                                            display:flex;align-items:center;justify-content:center;font-size:1.1rem;flex-shrink:0;">{icon}</div>
+                                <div style="font-size:0.9rem;font-weight:800;color:#111a3b;line-height:1.25;">{title}</div>
+                            </div>
+                            <div style="font-size:0.78rem;color:#475569;line-height:1.45;">{desc}</div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )            
 def guess(cols, keywords, exclude=()):
     for kw in keywords:
         for c in cols:
