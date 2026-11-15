@@ -10,6 +10,8 @@ Run:  streamlit run app.py
 """
 import io
 import os
+from typing import Optional
+import joblib
 import numpy as np
 import pandas as pd
 import plotly.express as px
@@ -19,7 +21,8 @@ import streamlit as st
 # =====================================================================
 # CONFIG  -  edit this block only
 # =====================================================================
-DEFAULT_DATA_PATH = "Data/Main_Clean.csv"      # optional default dataset if no CSV is uploaded
+DEFAULT_DATA_PATH = "Data/Main_Clean.csv"
+KMEANS_MODEL_PATH = "Models/kmeans_model.pkl"     # optional default dataset if no CSV is uploaded
 
 # Map the dashboard fields to YOUR column names.
 # Leave a value as None to auto-detect from the CSV column names.
