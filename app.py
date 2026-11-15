@@ -113,7 +113,32 @@ section[data-testid="stSidebar"] div[role="radiogroup"] label:has(input:checked)
 div[data-testid="stVerticalBlockBorderWrapper"] {background: #fff; border: 1px solid #eef0f6 !important; border-radius: 12px;}
 div.stButton > button {background: #5856eb; color: #fff; border: 0; border-radius: 8px; font-weight: 600;}
 div.stButton > button:hover {background: #4341d6; color: #fff;}
-
+/* High-contrast Regional Analysis radio labels ("Average per customer" / "Total") */
+section.main div[data-testid="stRadio"] label,
+section.main div[data-testid="stRadio"] label p,
+section.main div[data-testid="stRadio"] div[role="radiogroup"] label * {
+    color: #111a3b !important;
+    opacity: 1 !important;
+    font-weight: 600 !important;
+}
+/* High-contrast dark text for main-area expanders ("View Dataset Preview") & radios ("Average per customer" / "Total") */
+[data-testid="stAppViewContainer"] [data-testid="stMain"] [data-testid="stExpander"] summary,
+[data-testid="stAppViewContainer"] [data-testid="stMain"] [data-testid="stExpander"] summary:hover,
+[data-testid="stAppViewContainer"] [data-testid="stMain"] [data-testid="stExpander"] details[open] > summary {
+    background-color: #ffffff !important;
+    color: #172033 !important;
+    border-radius: 8px !important;
+}
+[data-testid="stAppViewContainer"] [data-testid="stMain"] [data-testid="stExpander"] summary *,
+[data-testid="stAppViewContainer"] [data-testid="stMain"] [data-testid="stRadio"] label,
+[data-testid="stAppViewContainer"] [data-testid="stMain"] [data-testid="stRadio"] label *,
+[data-testid="stAppViewContainer"] [data-testid="stMain"] [data-testid="stMultiSelect"] label,
+[data-testid="stAppViewContainer"] [data-testid="stMain"] [data-testid="stSelectbox"] label {
+    color: #172033 !important;
+    fill: #172033 !important;
+    opacity: 1 !important;
+    font-weight: 600 !important;
+}
 /* Sidebar Upload Dropzone Contrast */
 section[data-testid="stSidebar"] div[data-testid="stFileUploader"] section {
     background: #1e294b; border: 1px dashed #475569; border-radius: 10px; padding: 8px 10px;
@@ -144,7 +169,312 @@ def get_active_raw():
         return load_file_from_path(DEFAULT_DATA_PATH, os.path.getmtime(DEFAULT_DATA_PATH)), DEFAULT_DATA_PATH
     return None, None
 
+@st.cache_resource
+def load_kmeans_bundle(path: str = KMEANS_MODEL_PATH):
+    """Loads and caches the pre-trained K-Means dictionary bundle once."""
+    if not os.path.exists(path):
+        return None, f"Model file not found at `{path}`."
+    try:
+        bundle = joblib.load(path)
+        if not isinstance(bundle, dict) or not {"pipeline", "cluster_names", "features"}.issubset(bundle.keys()):
+            return None, "Invalid K-Means bundle: expected keys 'pipeline', 'cluster_names', and 'features'."
+        return bundle, None
+    except Exception as exc:
+        return None, f"Failed to load K-Means model: {exc}"
 
+
+def render_customer_segmentation():
+    """Renders the Customer Segmentation page using the active dataset and Models/kmeans_model.pkl."""
+    st.markdown('<div class="welcome">Customer <span style="color:#4f63e8">Segmentation</span></div>',
+                unsafe_allow_html=True)
+    st.markdown('<div class="tagline">Behavioral clustering powered by pre-trained K-Means &nbsp;•&nbsp; '
+                'Segment telemetry &amp; profiling</div>', unsafe_allow_html=True)
+
+    raw, source_name = get_active_raw()
+    if raw is None or raw.empty:
+        st.markdown("""<div class="vacant"><div style="font-size:2.5rem">📂</div>
+            <h3>No dataset available</h3>
+            <p>Ensure <b>Data/Main_Clean.csv</b> exists or upload a CSV/Excel file in the left sidebar.</p></div>""",
+            unsafe_allow_html=True)
+        return
+
+    st.markdown(
+        f'<div style="color:#334155;font-size:0.84rem;font-weight:600;margin:-4px 0 12px 0;">'
+        f'📁 Active Dataset: <span style="color:#111a3b;">{source_name}</span> ({len(raw):,} total records)</div>',
+        unsafe_allow_html=True,
+    )
+
+    bundle, model_err = load_kmeans_bundle()
+    if model_err:
+        st.error(f"❌ {model_err}")
+        return
+
+    pipeline = bundle["pipeline"]
+    cluster_names = bundle["cluster_names"]
+    required_features = list(bundle["features"])  # ['AnnualIncome', 'AnnualPurchaseAmount', 'PurchaseFrequency']
+
+    # Validate that all 3 required K-Means features exist (never use CustomerSegment for predictions)
+    missing_req = [col for col in required_features if col not in raw.columns]
+    if missing_req:
+        st.warning(
+            f"⚠️ Cannot run K-Means segmentation because required feature(s) are missing: "
+            f"**{', '.join(missing_req)}**. Expected features: `{required_features}`."
+        )
+        return
+
+    # Preserve all rows; coerce numeric types and let the saved pipeline impute & scale nulls
+    work_df = raw.copy()
+    for feat in required_features:
+        work_df[feat] = pd.to_numeric(work_df[feat], errors="coerce")
+
+    if work_df[required_features].isna().all().all():
+        st.warning("⚠️ None of the three required K-Means features contain valid numeric values.")
+        return
+
+    raw_clusters = pipeline.predict(work_df[required_features])
+    work_df["PredictedSegment"] = pd.Series(raw_clusters, index=work_df.index).map(cluster_names).fillna("Unknown")
+
+    # Apply Top Search Filter if typed
+    q = st.session_state.get("search", "").strip().lower()
+    if q:
+        search_cols = [c for c in ["CustomerID", "Region", "Gender", "ProductCategory", "PredictedSegment"] if c in work_df.columns]
+        if search_cols:
+            work_df = work_df[work_df[search_cols].astype(str).apply(lambda s: s.str.lower().str.contains(q)).any(axis=1)]
+            if work_df.empty:
+                st.warning(f"No segmented customers match “{q}”.")
+                return
+
+    # ---------------- E. FILTERS (Region, Gender, ProductCategory) ----------------
+    with st.container(border=True):
+        st.markdown('<div class="ct">🎛️ Segment Filters</div>', unsafe_allow_html=True)
+        f1, f2, f3 = st.columns(3)
+        filtered_df = work_df.copy()
+
+        with f1:
+            if "Region" in filtered_df.columns:
+                reg_opts = sorted(filtered_df["Region"].dropna().astype(str).unique().tolist())
+                sel_reg = st.multiselect("Region", options=reg_opts, default=[], placeholder="All Regions", key="seg_reg")
+                if sel_reg:
+                    filtered_df = filtered_df[filtered_df["Region"].astype(str).isin(sel_reg)]
+            else:
+                st.selectbox("Region", options=["Column not in dataset"], disabled=True, key="seg_reg_na")
+
+        with f2:
+            if "Age" in filtered_df.columns:
+                age_options = ["18–25 years", "26–35 years", "36–50 years", "50+ years"]
+                sel_ages = st.multiselect(
+                    "Age Group",
+                    options=age_options,
+                    default=[],
+                    placeholder="All Age Groups",
+                    key="seg_age_group",
+                )
+                if sel_ages:
+                    age_num = pd.to_numeric(filtered_df["Age"], errors="coerce")
+                    age_mask = pd.Series(False, index=filtered_df.index)
+                    if "18–25 years" in sel_ages:
+                        age_mask |= (age_num >= 18) & (age_num <= 25)
+                    if "26–35 years" in sel_ages:
+                        age_mask |= (age_num >= 26) & (age_num <= 35)
+                    if "36–50 years" in sel_ages:
+                        age_mask |= (age_num >= 36) & (age_num <= 50)
+                    if "50+ years" in sel_ages:
+                        age_mask |= (age_num > 50)
+                    filtered_df = filtered_df[age_mask]
+            else:
+                st.selectbox("Age Group", options=["Column not in dataset"], disabled=True, key="seg_age_na")
+
+        with f3:
+            if "ProductCategory" in filtered_df.columns:
+                cat_opts = sorted(filtered_df["ProductCategory"].dropna().astype(str).unique().tolist())
+                sel_cat = st.multiselect("Product Category", options=cat_opts, default=[], placeholder="All Categories", key="seg_cat")
+                if sel_cat:
+                    filtered_df = filtered_df[filtered_df["ProductCategory"].astype(str).isin(sel_cat)]
+            else:
+                st.selectbox("Product Category", options=["Column not in dataset"], disabled=True, key="seg_cat_na")
+
+    if filtered_df.empty:
+        st.warning("⚠️ No customers match the selected filters. Clear one or more filters to view segments.")
+        return
+
+    st.write("")
+
+    # ---------------- A. 4 KPI CARDS ----------------
+    total_cust = len(filtered_df)
+    seg_counts = filtered_df["PredictedSegment"].value_counts()
+    num_segments = int(seg_counts.shape[0])
+    spend_s = pd.to_numeric(filtered_df["AnnualPurchaseAmount"], errors="coerce")
+    avg_spend = float(spend_s.mean()) if spend_s.notna().any() else 0.0
+    top_seg = str(seg_counts.index[0])
+    top_pct = (seg_counts.iloc[0] / total_cust) * 100
+
+    c = st.columns(4)
+    kpi(c[0], "👥", "Total Customers", f"{total_cust:,}", "Filtered active cohort", "#e8f1fd")
+    kpi(c[1], "🧩", "Number of Segments", f"{num_segments}", "K-Means behavioral clusters", "#e3f6ec")
+    kpi(c[2], CURRENCY, "Average Annual Spend", money(avg_spend), "Per customer annual mean", "#f0eafd")
+    kpi(c[3], "🏆", "Top Segment", top_seg, f"{seg_counts.iloc[0]:,} customers ({top_pct:.1f}%)", "#fdf3df")
+    st.write("")
+
+    # ---------------- B. DONUT CHART & C. BAR CHART ----------------
+    segment_order = ["Premium", "Regular", "Budget"]
+    segment_colors = {
+        "Budget": "#fb923c",   # Orange
+        "Regular": "#22c277",  # Green
+        "Premium": "#3b82f6",  # Blue
+    }
+    ordered_segs = [s for s in segment_order if s in seg_counts.index] + [
+        s for s in seg_counts.index if s not in segment_order
+    ]
+
+    r_charts = st.columns([1, 1.2])
+
+    with r_charts[0]:
+        st.markdown('<div class="card"><h4>Segment Distribution</h4>', unsafe_allow_html=True)
+        donut_vals = [int(seg_counts[s]) for s in ordered_segs]
+        donut_colors = [segment_colors.get(s, "#94a3b8") for s in ordered_segs]
+
+        legend_labels = [f"{s} ({seg_counts[s]:,})" for s in ordered_segs]
+        fig_donut = go.Figure(go.Pie(
+            labels=legend_labels,
+            values=donut_vals,
+            hole=0.56,
+            sort=False,
+            marker=dict(colors=donut_colors, line=dict(color="#ffffff", width=2)),
+            textinfo="percent",
+            textposition="inside",
+            insidetextorientation="horizontal",
+            textfont=dict(size=12, color="#ffffff"),
+            customdata=ordered_segs,
+            hovertemplate="<b>%{customdata}</b><br>Customers: %{value:,}<br>Share: %{percent}<extra></extra>",
+        ))
+        fig_donut.add_annotation(
+            text=f"<b>{total_cust:,}</b><br>Customers",
+            showarrow=False,
+            font=dict(size=13, color="#172033"),
+        )
+        fig_donut.update_layout(
+            legend=dict(
+                orientation="h",
+                x=0.5,
+                xanchor="center",
+                y=-0.08,
+                font=dict(size=11, color="#172033"),
+            )
+        )
+        fig_donut = style_chart(fig_donut, h=320)
+        fig_donut.update_layout(margin=dict(l=16, r=16, t=24, b=42))
+        st.plotly_chart(fig_donut, use_container_width=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    with r_charts[1]:
+        st.markdown('<div class="card"><h4>Average Annual Purchase Amount by Segment</h4>', unsafe_allow_html=True)
+        avg_by_seg = (
+            filtered_df.groupby("PredictedSegment")["AnnualPurchaseAmount"]
+            .mean()
+            .reindex(ordered_segs)
+            .fillna(0.0)
+        )
+        bar_colors = [segment_colors.get(s, "#94a3b8") for s in ordered_segs]
+
+        fig_bar = go.Figure(go.Bar(
+            x=ordered_segs,
+            y=avg_by_seg.values,
+            marker_color=bar_colors,
+            text=[money(v) for v in avg_by_seg.values],
+            textposition="outside",
+            cliponaxis=False,
+            textfont=dict(size=12, color="#172033"),
+            hovertemplate="<b>%{x}</b><br>Avg Annual Spend: %{text}<extra></extra>",
+        ))
+        max_val = float(avg_by_seg.max()) if len(avg_by_seg) > 0 and avg_by_seg.max() > 0 else 1000.0
+        fig_bar.update_yaxes(
+            range=[0, max_val * 1.28],
+            gridcolor="#e2e8f0",
+            tickprefix=CURRENCY,
+            tickformat="~s",
+        )
+        st.plotly_chart(style_chart(fig_bar, h=300), use_container_width=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    st.write("")
+
+    # ---------------- D. SEGMENT CHARACTERISTICS TABLE ----------------
+    with st.container(border=True):
+        st.markdown('<div class="ct">📋 Segment Characteristics</div>', unsafe_allow_html=True)
+        metric_cols = {
+            "Age": "Average Age",
+            "AnnualIncome": "Average Annual Income",
+            "PurchaseFrequency": "Average Purchase Frequency",
+            "AnnualPurchaseAmount": "Average Annual Purchase Amount",
+            "ReturnRate": "Average Return Rate",
+            "DiscountUsage": "Average Discount Usage",
+        }
+        rows = []
+        for seg_name in ordered_segs:
+            sub = filtered_df[filtered_df["PredictedSegment"] == seg_name]
+            row = {"Segment": seg_name, "Customer Count": f"{len(sub):,}"}
+            for raw_col, label in metric_cols.items():
+                if raw_col in sub.columns:
+                    s_num = pd.to_numeric(sub[raw_col], errors="coerce")
+                    if s_num.notna().any():
+                        val = float(s_num.mean())
+                        if raw_col in ("AnnualIncome", "AnnualPurchaseAmount"):
+                            row[label] = money(val)
+                        elif raw_col == "Age":
+                            row[label] = f"{val:.1f} yrs"
+                        elif raw_col == "PurchaseFrequency":
+                            row[label] = f"{val:.1f}"
+                        else:
+                            row[label] = f"{val:.2f}"
+                    else:
+                        row[label] = "N/A"
+                else:
+                    row[label] = "N/A"
+            rows.append(row)
+
+        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+
+    st.write("")
+
+    # ---------------- F. SEGMENT INSIGHTS CARDS (Premium, Regular, Budget) ----------------
+    st.markdown('<div class="sec" style="margin-bottom:8px;">Segment Insights</div>', unsafe_allow_html=True)
+    ins_cols = st.columns(3)
+    meta = {
+        "Premium": ("👑", "#e8f1fd", "#3b82f6", "High-spending loyal customers driving top-line revenue."),
+        "Regular": ("⭐", "#e3f6ec", "#22c277", "Consistent mid-tier buyers with strong repeat potential."),
+        "Budget": ("🏷️", "#fdf3df", "#fb923c", "Value-conscious shoppers responsive to targeted promotions."),
+    }
+
+    for idx, seg_name in enumerate(["Premium", "Regular", "Budget"]):
+        icon, bg, accent, desc = meta[seg_name]
+        sub = filtered_df[filtered_df["PredictedSegment"] == seg_name]
+        cnt = len(sub)
+        inc_s = pd.to_numeric(sub["AnnualIncome"], errors="coerce")
+        spd_s = pd.to_numeric(sub["AnnualPurchaseAmount"], errors="coerce")
+        frq_s = pd.to_numeric(sub["PurchaseFrequency"], errors="coerce")
+
+        inc_txt = money(inc_s.mean()) if cnt > 0 and inc_s.notna().any() else f"{CURRENCY} 0"
+        spd_txt = money(spd_s.mean()) if cnt > 0 and spd_s.notna().any() else f"{CURRENCY} 0"
+        frq_txt = f"{frq_s.mean():.1f} / yr" if cnt > 0 and frq_s.notna().any() else "0.0 / yr"
+
+        with ins_cols[idx]:
+            st.markdown(f"""
+            <div class="card" style="border-top: 4px solid {accent};">
+                <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">
+                    <div style="width:36px;height:36px;border-radius:50%;background:{bg};display:flex;align-items:center;justify-content:center;font-size:1.1rem;">{icon}</div>
+                    <div>
+                        <div style="font-size:1rem;font-weight:800;color:#111a3b;">{seg_name} Segment</div>
+                        <div style="font-size:.72rem;color:#64748b;">{desc}</div>
+                    </div>
+                </div>
+                <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px;padding-top:10px;border-top:1px solid #eef0f6;font-size:.78rem;">
+                    <div><span style="color:#64748b;">Customers:</span><br><b style="color:#111a3b;">{cnt:,}</b></div>
+                    <div><span style="color:#64748b;">Avg Income:</span><br><b style="color:#111a3b;">{inc_txt}</b></div>
+                    <div><span style="color:#64748b;">Avg Spending:</span><br><b style="color:#111a3b;">{spd_txt}</b></div>
+                    <div><span style="color:#64748b;">Purchase Freq:</span><br><b style="color:#111a3b;">{frq_txt}</b></div>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
 def guess(cols, keywords, exclude=()):
     for kw in keywords:
         for c in cols:
@@ -344,8 +674,10 @@ if page == "Overview":
         kpi(c[3], "💰", "Total Annual Revenue", "–",
             "No valid AnnualPurchaseAmount values", "#fdf3df")
     st.write("")
-
-    # ---------------- ROW 2: 3 CHARTS ----------------
+# ---------------- DATA OVERVIEW (BETWEEN KPI CARDS & CHARTS) ----------------
+    st.markdown('<div class="sec" style="margin-bottom:6px;">Data Overview</div>', unsafe_allow_html=True)
+    with st.expander("View Dataset Preview", expanded=False):
+        st.dataframe(raw.head(5), hide_index=True, use_container_width=True)
     r1 = st.columns([1, 1.25, 1])
 
     # Chart 1 (Donut)
@@ -601,6 +933,47 @@ if page == "Overview":
             <p>Explore customer behavior, train unsupervised segments and predict future spending
             with our ML-powered insights.</p></div>""", unsafe_allow_html=True)
         st.button("Go to Detailed Analysis →", on_click=go_analysis)
+
+# # ---------------- ROW 5: EXPANDABLE DATA OVERVIEW ----------------
+#     st.write("")
+#     st.markdown('<div class="sec">Data Overview</div>', unsafe_allow_html=True)
+#     with st.expander("📋 Data Overview (First 5 Rows & Column Schema)", expanded=False):
+#         preview_df = raw.head(5).copy()
+
+#         # Derive PredictedSegment on the 5 preview rows using the cached K-Means bundle
+#         bundle, model_err = load_kmeans_bundle()
+#         if model_err:
+#             st.warning(f"⚠️ Could not generate `PredictedSegment` preview: {model_err}")
+#         else:
+#             req_feats = list(bundle["features"])  # ['AnnualIncome', 'AnnualPurchaseAmount', 'PurchaseFrequency']
+#             missing_feats = [col for col in req_feats if col not in preview_df.columns]
+#             if missing_feats:
+#                 st.warning(
+#                     f"⚠️ `PredictedSegment` skipped — missing required model feature(s): "
+#                     f"**{', '.join(missing_feats)}**."
+#                 )
+#             else:
+#                 feat_matrix = preview_df[req_feats].apply(pd.to_numeric, errors="coerce")
+#                 if feat_matrix.isna().all().all():
+#                     st.warning("⚠️ `PredictedSegment` skipped — required feature columns contain no numeric values.")
+#                 else:
+#                     cluster_ids = bundle["pipeline"].predict(feat_matrix)
+#                     preview_df["PredictedSegment"] = (
+#                         pd.Series(cluster_ids, index=preview_df.index)
+#                         .map(bundle["cluster_names"])
+#                         .fillna("Unknown")
+#                     )
+
+#         st.caption(
+#             f"**Columns ({len(preview_df.columns)}):** "
+#             + ", ".join([f"`{c}`" for c in preview_df.columns.astype(str)])
+#         )
+#         st.dataframe(preview_df, hide_index=True, use_container_width=True)
+# # =====================================================================
+# PAGE 2: CUSTOMER SEGMENTATION
+# =====================================================================
+elif page == "Customer Segmentation":
+    render_customer_segmentation()
 
 
 # =====================================================================
