@@ -687,12 +687,18 @@ def render_spending_prediction():
                 missing_cols.append(feat)
                 feat_df[feat] = np.nan
 
-    if missing_cols:
+    if len(missing_cols) == len(expected_features) or feat_df.isna().all().all():
         st.warning(
-            f"⚠️ Required model feature(s) missing from **{source_name}**: **{', '.join(missing_cols)}**. "
-            f"Expected features: `{expected_features}`."
+            f"⚠️ Cannot run Spending Prediction because none of the required model features "
+            f"(`{expected_features}`) are available in **{source_name}**."
         )
         return
+
+    if missing_cols:
+        st.info(
+            f"ℹ️ **{source_name}** is missing **{', '.join(missing_cols)}**. "
+            f"Using the saved regression pipeline's built-in median imputer for those feature(s)."
+        )
 
     if feat_df.isna().all().all():
         st.warning("⚠️ None of the required model features contain valid numeric values in the active dataset.")
@@ -1188,467 +1194,468 @@ def render_spending_prediction():
                     )
 
 
-def render_spending_prediction():
-    """Renders the redesigned Spending Prediction page with cohort filters, regional/category comparisons, accuracy metrics, and insights."""
-    st.markdown(
-        '<div class="welcome">Spending <span style="color:#4f63e8">Prediction</span></div>',
-        unsafe_allow_html=True,
-    )
-    st.markdown(
-        '<div class="tagline">Actual vs. predicted annual spending across regions and product categories '
-        '&nbsp;•&nbsp; Powered by pre-trained HistGradientBoosting regression</div>',
-        unsafe_allow_html=True,
-    )
+# def render_spending_prediction():
+#     """Renders the redesigned Spending Prediction page with cohort filters, regional/category comparisons, accuracy metrics, and insights."""
+#     st.markdown(
+#         '<div class="welcome">Spending <span style="color:#4f63e8">Prediction</span></div>',
+#         unsafe_allow_html=True,
+#     )
+#     st.markdown(
+#         '<div class="tagline">Actual vs. predicted annual spending across regions and product categories '
+#         '&nbsp;•&nbsp; Powered by pre-trained HistGradientBoosting regression</div>',
+#         unsafe_allow_html=True,
+#     )
 
-    raw, source_name = get_active_raw()
-    if raw is None or raw.empty:
-        st.markdown(
-            """<div class="vacant"><div style="font-size:2.5rem">📂</div>
-            <h3>No dataset available</h3>
-            <p>Ensure <b>Data/Main_Clean.csv</b> exists or upload a CSV/Excel file in the left sidebar.</p></div>""",
-            unsafe_allow_html=True,
-        )
-        return
+#     raw, source_name = get_active_raw()
+#     if raw is None or raw.empty:
+#         st.markdown(
+#             """<div class="vacant"><div style="font-size:2.5rem">📂</div>
+#             <h3>No dataset available</h3>
+#             <p>Ensure <b>Data/Main_Clean.csv</b> exists or upload a CSV/Excel file in the left sidebar.</p></div>""",
+#             unsafe_allow_html=True,
+#         )
+#         return
 
-    st.markdown(
-        f'<div style="color:#334155;font-size:0.84rem;font-weight:600;margin:-4px 0 12px 0;">'
-        f'📁 Active Dataset: <span style="color:#111a3b;">{source_name}</span> ({len(raw):,} total records)</div>',
-        unsafe_allow_html=True,
-    )
+#     st.markdown(
+#         f'<div style="color:#334155;font-size:0.84rem;font-weight:600;margin:-4px 0 12px 0;">'
+#         f'📁 Active Dataset: <span style="color:#111a3b;">{source_name}</span> ({len(raw):,} total records)</div>',
+#         unsafe_allow_html=True,
+#     )
 
-    reg_model, model_err = load_spending_model()
-    if model_err:
-        st.error(f"❌ {model_err}")
-        return
+#     reg_model, model_err = load_spending_model()
+#     if model_err:
+#         st.error(f"❌ {model_err}")
+#         return
 
-    expected_features = (
-        list(reg_model.feature_names_in_)
-        if hasattr(reg_model, "feature_names_in_")
-        else list(SPENDING_FEATURES)
-    )
+#     expected_features = (
+#         list(reg_model.feature_names_in_)
+#         if hasattr(reg_model, "feature_names_in_")
+#         else list(SPENDING_FEATURES)
+#     )
 
-    work_df = _resolve_recency_column(raw.copy())
+#     work_df = _resolve_recency_column(raw.copy())
 
-    # Convert CustomerTenureMonths -> CustomerTenure (in years) if CustomerTenure is absent
-    if "CustomerTenure" not in work_df.columns and "CustomerTenureMonths" in work_df.columns:
-        work_df["CustomerTenure"] = pd.to_numeric(work_df["CustomerTenureMonths"], errors="coerce") / 12.0
+#     # Convert CustomerTenureMonths -> CustomerTenure (in years) if CustomerTenure is absent
+#     if "CustomerTenure" not in work_df.columns and "CustomerTenureMonths" in work_df.columns:
+#         work_df["CustomerTenure"] = pd.to_numeric(work_df["CustomerTenureMonths"], errors="coerce") / 12.0
 
-    # Case/space-insensitive column matching for remaining features
-    norm_col_map = {c.lower().replace(" ", "").replace("_", ""): c for c in work_df.columns}
-    missing_cols = []
-    feat_df = pd.DataFrame(index=work_df.index)
+#     # Case/space-insensitive column matching for remaining features
+#     norm_col_map = {c.lower().replace(" ", "").replace("_", ""): c for c in work_df.columns}
+#     missing_cols = []
+#     feat_df = pd.DataFrame(index=work_df.index)
 
-    for feat in expected_features:
-        if feat in work_df.columns:
-            feat_df[feat] = pd.to_numeric(work_df[feat], errors="coerce")
-        else:
-            matched = norm_col_map.get(feat.lower().replace(" ", "").replace("_", ""))
-            if matched is not None:
-                feat_df[feat] = pd.to_numeric(work_df[matched], errors="coerce")
-            else:
-                missing_cols.append(feat)
-                feat_df[feat] = np.nan
+#     for feat in expected_features:
+#         if feat in work_df.columns:
+#             feat_df[feat] = pd.to_numeric(work_df[feat], errors="coerce")
+#         else:
+#             matched = norm_col_map.get(feat.lower().replace(" ", "").replace("_", ""))
+#             if matched is not None:
+#                 feat_df[feat] = pd.to_numeric(work_df[matched], errors="coerce")
+#             else:
+#                 missing_cols.append(feat)
+#                 feat_df[feat] = np.nan
 
-    if len(missing_cols) == len(expected_features) or feat_df.isna().all().all():
-        st.warning(
-            f"⚠️ Cannot run Spending Prediction because none of the required model features "
-            f"(`{expected_features}`) are available in **{source_name}**."
-        )
-        return
+#     if len(missing_cols) == len(expected_features) or feat_df.isna().all().all():
+#         st.warning(
+#             f"⚠️ Cannot run Spending Prediction because none of the required model features "
+#             f"(`{expected_features}`) are available in **{source_name}**."
+#         )
+#         return
 
-    if missing_cols:
-        st.info(
-            f"ℹ️ **{source_name}** is missing **{', '.join(missing_cols)}**. "
-            f"Using the saved regression pipeline's built-in median imputer for those feature(s)."
-        )
+#     if missing_cols:
+#         st.info(
+#             f"ℹ️ **{source_name}** is missing **{', '.join(missing_cols)}**. "
+#             f"Using the saved regression pipeline's built-in median imputer for those feature(s)."
+#         )
 
-    if feat_df.isna().all().all():
-        st.warning("⚠️ None of the six required model features contain valid numeric values in the active dataset.")
-        return
+#     if feat_df.isna().all().all():
+#         st.warning("⚠️ None of the six required model features contain valid numeric values in the active dataset.")
+#         return
 
-    work_df["PredictedAnnualPurchaseAmount"] = reg_model.predict(feat_df[expected_features])
-    work_df["_actual_spend"] = (
-        pd.to_numeric(work_df["AnnualPurchaseAmount"], errors="coerce")
-        if "AnnualPurchaseAmount" in work_df.columns
-        else np.nan
-    )
+#     work_df["PredictedAnnualPurchaseAmount"] = reg_model.predict(feat_df[expected_features])
+#     work_df["_actual_spend"] = (
+#         pd.to_numeric(work_df["AnnualPurchaseAmount"], errors="coerce")
+#         if "AnnualPurchaseAmount" in work_df.columns
+#         else np.nan
+#     )
 
-    q = st.session_state.get("search", "").strip().lower()
-    if q:
-        search_cols = [c for c in ["CustomerID", "Region", "Gender", "ProductCategory"] if c in work_df.columns]
-        if search_cols:
-            mask = work_df[search_cols].astype(str).apply(lambda s: s.str.lower().str.contains(q)).any(axis=1)
-            work_df = work_df.loc[mask].copy()
-            if work_df.empty:
-                st.warning(f"No customers match “{q}”.")
-                return
+#     q = st.session_state.get("search", "").strip().lower()
+#     if q:
+#         search_cols = [c for c in ["CustomerID", "Region", "Gender", "ProductCategory"] if c in work_df.columns]
+#         if search_cols:
+#             mask = work_df[search_cols].astype(str).apply(lambda s: s.str.lower().str.contains(q)).any(axis=1)
+#             work_df = work_df.loc[mask].copy()
+#             if work_df.empty:
+#                 st.warning(f"No customers match “{q}”.")
+#                 return
 
-    # ---------------- 3. COHORT FILTERS (Region, Age Group, Product Category) ----------------
-    filtered_df = _apply_spending_filters(work_df)
-    if filtered_df.empty:
-        st.warning("⚠️ No customers match the selected filters. Clear one or more filters to view spending analysis.")
-        return
+#     # ---------------- 3. COHORT FILTERS (Region, Age Group, Product Category) ----------------
+#     filtered_df = _apply_spending_filters(work_df)
+#     if filtered_df.empty:
+#         st.warning("⚠️ No customers match the selected filters. Clear one or more filters to view spending analysis.")
+#         return
 
-    st.write("")
+#     st.write("")
 
-    # ---------------- 4. FOUR KPI CARDS ----------------
-    total_cust = int(len(filtered_df))
-    valid_act = filtered_df["_actual_spend"].dropna()
-    valid_pred = filtered_df["PredictedAnnualPurchaseAmount"].dropna()
-    valid_both = filtered_df.dropna(subset=["_actual_spend", "PredictedAnnualPurchaseAmount"])
+#     # ---------------- 4. FOUR KPI CARDS ----------------
+#     total_cust = int(len(filtered_df))
+#     valid_act = filtered_df["_actual_spend"].dropna()
+#     valid_pred = filtered_df["PredictedAnnualPurchaseAmount"].dropna()
+#     valid_both = filtered_df.dropna(subset=["_actual_spend", "PredictedAnnualPurchaseAmount"])
 
-    avg_actual_txt = money(float(valid_act.mean())) if not valid_act.empty else "N/A"
-    avg_actual_sub = f"Across {len(valid_act):,} observed records" if not valid_act.empty else "No actual spend values"
+#     avg_actual_txt = money(float(valid_act.mean())) if not valid_act.empty else "N/A"
+#     avg_actual_sub = f"Across {len(valid_act):,} observed records" if not valid_act.empty else "No actual spend values"
 
-    avg_pred_txt = money(float(valid_pred.mean())) if not valid_pred.empty else "N/A"
-    avg_pred_sub = (
-        f"Median {money(float(valid_pred.median()))} (model output)"
-        if not valid_pred.empty
-        else "No predictions available"
-    )
+#     avg_pred_txt = money(float(valid_pred.mean())) if not valid_pred.empty else "N/A"
+#     avg_pred_sub = (
+#         f"Median {money(float(valid_pred.median()))} (model output)"
+#         if not valid_pred.empty
+#         else "No predictions available"
+#     )
 
-    if not valid_both.empty:
-        abs_errors = (valid_both["_actual_spend"] - valid_both["PredictedAnnualPurchaseAmount"]).abs()
-        mae_kpi_txt = money(float(abs_errors.mean()))
-        mae_kpi_sub = f"Avg |Actual − Predicted| ({len(valid_both):,} rows)"
-    else:
-        mae_kpi_txt = "N/A"
-        mae_kpi_sub = "Requires actual & predicted values"
+#     if not valid_both.empty:
+#         abs_errors = (valid_both["_actual_spend"] - valid_both["PredictedAnnualPurchaseAmount"]).abs()
+#         mae_kpi_txt = money(float(abs_errors.mean()))
+#         mae_kpi_sub = f"Avg |Actual − Predicted| ({len(valid_both):,} rows)"
+#     else:
+#         mae_kpi_txt = "N/A"
+#         mae_kpi_sub = "Requires actual & predicted values"
 
-    c = st.columns(4)
-    kpi(c[0], "👥", "Total Customers", f"{total_cust:,}", "Filtered cohort size", "#e8f1fd")
-    kpi(c[1], "🧾", "Avg. Actual Annual Spending", avg_actual_txt, avg_actual_sub, "#e3f6ec")
-    kpi(c[2], "📈", "Avg. Predicted Annual Spending", avg_pred_txt, avg_pred_sub, "#f0eafd")
-    kpi(c[3], "🎯", "Mean Absolute Prediction Error", mae_kpi_txt, mae_kpi_sub, "#fdf3df")
+#     c = st.columns(4)
+#     kpi(c[0], "👥", "Total Customers", f"{total_cust:,}", "Filtered cohort size", "#e8f1fd")
+#     kpi(c[1], "🧾", "Avg. Actual Annual Spending", avg_actual_txt, avg_actual_sub, "#e3f6ec")
+#     kpi(c[2], "📈", "Avg. Predicted Annual Spending", avg_pred_txt, avg_pred_sub, "#f0eafd")
+#     kpi(c[3], "🎯", "Mean Absolute Prediction Error", mae_kpi_txt, mae_kpi_sub, "#fdf3df")
 
-    st.write("")
+#     st.write("")
 
-    # ---------------- 5. REGIONAL SPENDING ANALYSIS ----------------
-    reg_summary = pd.DataFrame()
-    if "Region" in filtered_df.columns and filtered_df["Region"].notna().any():
-        st.markdown('<div class="sec" style="margin-bottom:8px;">Regional Spending Analysis</div>', unsafe_allow_html=True)
-        reg_summary = _build_grouped_spending_table(filtered_df, "Region", "Region")
+#     # ---------------- 5. REGIONAL SPENDING ANALYSIS ----------------
+#     reg_summary = pd.DataFrame()
+#     if "Region" in filtered_df.columns and filtered_df["Region"].notna().any():
+#         st.markdown('<div class="sec" style="margin-bottom:8px;">Regional Spending Analysis</div>', unsafe_allow_html=True)
+#         reg_summary = _build_grouped_spending_table(filtered_df, "Region", "Region")
 
-        if not reg_summary.empty:
-            reg_col_chart, reg_col_tbl = st.columns([1.25, 1])
+#         if not reg_summary.empty:
+#             reg_col_chart, reg_col_tbl = st.columns([1.25, 1])
 
-            with reg_col_chart:
-                st.markdown('<div class="card"><h4>Actual vs Predicted Annual Spending by Region</h4>', unsafe_allow_html=True)
-                fig_reg = go.Figure()
-                fig_reg.add_trace(
-                    go.Bar(
-                        name="Average Actual Spending",
-                        x=reg_summary["Region"],
-                        y=reg_summary["_avg_actual"],
-                        marker_color="#22c277",
-                        text=[money(v) if pd.notna(v) else "N/A" for v in reg_summary["_avg_actual"]],
-                        textposition="outside",
-                        cliponaxis=False,
-                        textfont=dict(size=10, color="#172033"),
-                        hovertemplate="<b>%{x}</b><br>Avg Actual: %{text}<extra></extra>",
-                    )
-                )
-                fig_reg.add_trace(
-                    go.Bar(
-                        name="Average Predicted Spending",
-                        x=reg_summary["Region"],
-                        y=reg_summary["_avg_pred"],
-                        marker_color="#3b82f6",
-                        text=[money(v) if pd.notna(v) else "N/A" for v in reg_summary["_avg_pred"]],
-                        textposition="outside",
-                        cliponaxis=False,
-                        textfont=dict(size=10, color="#172033"),
-                        hovertemplate="<b>%{x}</b><br>Avg Predicted: %{text}<extra></extra>",
-                    )
-                )
-                max_reg_y = float(
-                    np.nanmax([reg_summary["_avg_actual"].max(), reg_summary["_avg_pred"].max()])
-                )
-                max_reg_y = max_reg_y if pd.notna(max_reg_y) and max_reg_y > 0 else 1000.0
-                fig_reg = style_chart(fig_reg, h=330)
-                fig_reg.update_layout(
-                    barmode="group",
-                    bargap=0.22,
-                    bargroupgap=0.08,
-                    margin=dict(l=12, r=16, t=44, b=16),
-                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
-                )
-                fig_reg.update_xaxes(title_text="Region")
-                fig_reg.update_yaxes(
-                    title_text=f"Average Annual Spending ({CURRENCY})",
-                    tickprefix=CURRENCY,
-                    tickformat="~s",
-                    gridcolor="#e2e8f0",
-                    range=[0, max_reg_y * 1.28],
-                )
-                st.plotly_chart(fig_reg, use_container_width=True)
-                st.markdown("</div>", unsafe_allow_html=True)
+#             with reg_col_chart:
+#                 st.markdown('<div class="card"><h4>Actual vs Predicted Annual Spending by Region</h4>', unsafe_allow_html=True)
+#                 fig_reg = go.Figure()
+#                 fig_reg.add_trace(
+#                     go.Bar(
+#                         name="Average Actual Spending",
+#                         x=reg_summary["Region"],
+#                         y=reg_summary["_avg_actual"],
+#                         marker_color="#22c277",
+#                         text=[money(v) if pd.notna(v) else "N/A" for v in reg_summary["_avg_actual"]],
+#                         textposition="outside",
+#                         cliponaxis=False,
+#                         textfont=dict(size=10, color="#172033"),
+#                         hovertemplate="<b>%{x}</b><br>Avg Actual: %{text}<extra></extra>",
+#                     )
+#                 )
+#                 fig_reg.add_trace(
+#                     go.Bar(
+#                         name="Average Predicted Spending",
+#                         x=reg_summary["Region"],
+#                         y=reg_summary["_avg_pred"],
+#                         marker_color="#3b82f6",
+#                         text=[money(v) if pd.notna(v) else "N/A" for v in reg_summary["_avg_pred"]],
+#                         textposition="outside",
+#                         cliponaxis=False,
+#                         textfont=dict(size=10, color="#172033"),
+#                         hovertemplate="<b>%{x}</b><br>Avg Predicted: %{text}<extra></extra>",
+#                     )
+#                 )
+#                 max_reg_y = float(
+#                     np.nanmax([reg_summary["_avg_actual"].max(), reg_summary["_avg_pred"].max()])
+#                 )
+#                 max_reg_y = max_reg_y if pd.notna(max_reg_y) and max_reg_y > 0 else 1000.0
+#                 fig_reg = style_chart(fig_reg, h=330)
+#                 fig_reg.update_layout(
+#                     barmode="group",
+#                     bargap=0.22,
+#                     bargroupgap=0.08,
+#                     margin=dict(l=12, r=16, t=44, b=16),
+#                     legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+#                 )
+#                 fig_reg.update_xaxes(title_text="Region")
+#                 fig_reg.update_yaxes(
+#                     title_text=f"Average Annual Spending ({CURRENCY})",
+#                     tickprefix=CURRENCY,
+#                     tickformat="~s",
+#                     gridcolor="#e2e8f0",
+#                     range=[0, max_reg_y * 1.28],
+#                 )
+#                 st.plotly_chart(fig_reg, use_container_width=True)
+#                 st.markdown("</div>", unsafe_allow_html=True)
 
-            with reg_col_tbl:
-                with st.container(border=True):
-                    st.markdown('<div class="ct">📋 Regional Summary</div>', unsafe_allow_html=True)
-                    reg_display = pd.DataFrame({
-                        "Region": reg_summary["Region"],
-                        "Customer Count": reg_summary["Customer Count"].map(lambda x: f"{x:,}"),
-                        "Avg Actual Spending": reg_summary["_avg_actual"].map(lambda v: money(v) if pd.notna(v) else "N/A"),
-                        "Avg Predicted Spending": reg_summary["_avg_pred"].map(lambda v: money(v) if pd.notna(v) else "N/A"),
-                        "Mean Absolute Error": reg_summary["_mae"].map(lambda v: money(v) if pd.notna(v) else "N/A"),
-                    })
-                    st.dataframe(reg_display, hide_index=True, use_container_width=True)
+#             with reg_col_tbl:
+#                 with st.container(border=True):
+#                     st.markdown('<div class="ct">📋 Regional Summary</div>', unsafe_allow_html=True)
+#                     reg_display = pd.DataFrame({
+#                         "Region": reg_summary["Region"],
+#                         "Customer Count": reg_summary["Customer Count"].map(lambda x: f"{x:,}"),
+#                         "Avg Actual Spending": reg_summary["_avg_actual"].map(lambda v: money(v) if pd.notna(v) else "N/A"),
+#                         "Avg Predicted Spending": reg_summary["_avg_pred"].map(lambda v: money(v) if pd.notna(v) else "N/A"),
+#                         "Mean Absolute Error": reg_summary["_mae"].map(lambda v: money(v) if pd.notna(v) else "N/A"),
+#                     })
+#                     st.dataframe(reg_display, hide_index=True, use_container_width=True)
 
-        st.write("")
+#         st.write("")
 
-    # ---------------- 6. PRODUCT CATEGORY SPENDING ANALYSIS ----------------
-    cat_summary = pd.DataFrame()
-    if "ProductCategory" in filtered_df.columns and filtered_df["ProductCategory"].notna().any():
-        st.markdown('<div class="sec" style="margin-bottom:8px;">Product Category Spending Analysis</div>', unsafe_allow_html=True)
-        cat_summary = _build_grouped_spending_table(filtered_df, "ProductCategory", "Product Category")
+#     # ---------------- 6. PRODUCT CATEGORY SPENDING ANALYSIS ----------------
+#     cat_summary = pd.DataFrame()
+#     if "ProductCategory" in filtered_df.columns and filtered_df["ProductCategory"].notna().any():
+#         st.markdown('<div class="sec" style="margin-bottom:8px;">Product Category Spending Analysis</div>', unsafe_allow_html=True)
+#         cat_summary = _build_grouped_spending_table(filtered_df, "ProductCategory", "Product Category")
 
-        if not cat_summary.empty:
-            cat_col_chart, cat_col_tbl = st.columns([1.25, 1])
+#         if not cat_summary.empty:
+#             cat_col_chart, cat_col_tbl = st.columns([1.25, 1])
 
-            with cat_col_chart:
-                st.markdown(
-                    '<div class="card"><h4>Actual vs Predicted Annual Spending by Product Category</h4>',
-                    unsafe_allow_html=True,
-                )
-                fig_cat = go.Figure()
-                fig_cat.add_trace(
-                    go.Bar(
-                        name="Average Actual Spending",
-                        x=cat_summary["Product Category"],
-                        y=cat_summary["_avg_actual"],
-                        marker_color="#22c277",
-                        text=[money(v) if pd.notna(v) else "N/A" for v in cat_summary["_avg_actual"]],
-                        textposition="outside",
-                        cliponaxis=False,
-                        textfont=dict(size=10, color="#172033"),
-                        hovertemplate="<b>%{x}</b><br>Avg Actual: %{text}<extra></extra>",
-                    )
-                )
-                fig_cat.add_trace(
-                    go.Bar(
-                        name="Average Predicted Spending",
-                        x=cat_summary["Product Category"],
-                        y=cat_summary["_avg_pred"],
-                        marker_color="#4f63e8",
-                        text=[money(v) if pd.notna(v) else "N/A" for v in cat_summary["_avg_pred"]],
-                        textposition="outside",
-                        cliponaxis=False,
-                        textfont=dict(size=10, color="#172033"),
-                        hovertemplate="<b>%{x}</b><br>Avg Predicted: %{text}<extra></extra>",
-                    )
-                )
-                max_cat_y = float(
-                    np.nanmax([cat_summary["_avg_actual"].max(), cat_summary["_avg_pred"].max()])
-                )
-                max_cat_y = max_cat_y if pd.notna(max_cat_y) and max_cat_y > 0 else 1000.0
-                fig_cat = style_chart(fig_cat, h=340)
-                fig_cat.update_layout(
-                    barmode="group",
-                    bargap=0.22,
-                    bargroupgap=0.08,
-                    margin=dict(l=12, r=16, t=44, b=28),
-                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
-                )
-                fig_cat.update_xaxes(
-                    title_text="Product Category",
-                    tickangle=-18 if len(cat_summary) > 5 else 0,
-                )
-                fig_cat.update_yaxes(
-                    title_text=f"Average Annual Spending ({CURRENCY})",
-                    tickprefix=CURRENCY,
-                    tickformat="~s",
-                    gridcolor="#e2e8f0",
-                    range=[0, max_cat_y * 1.28],
-                )
-                st.plotly_chart(fig_cat, use_container_width=True)
-                st.markdown("</div>", unsafe_allow_html=True)
+#             with cat_col_chart:
+#                 st.markdown(
+#                     '<div class="card"><h4>Actual vs Predicted Annual Spending by Product Category</h4>',
+#                     unsafe_allow_html=True,
+#                 )
+#                 fig_cat = go.Figure()
+#                 fig_cat.add_trace(
+#                     go.Bar(
+#                         name="Average Actual Spending",
+#                         x=cat_summary["Product Category"],
+#                         y=cat_summary["_avg_actual"],
+#                         marker_color="#22c277",
+#                         text=[money(v) if pd.notna(v) else "N/A" for v in cat_summary["_avg_actual"]],
+#                         textposition="outside",
+#                         cliponaxis=False,
+#                         textfont=dict(size=10, color="#172033"),
+#                         hovertemplate="<b>%{x}</b><br>Avg Actual: %{text}<extra></extra>",
+#                     )
+#                 )
+#                 fig_cat.add_trace(
+#                     go.Bar(
+#                         name="Average Predicted Spending",
+#                         x=cat_summary["Product Category"],
+#                         y=cat_summary["_avg_pred"],
+#                         marker_color="#4f63e8",
+#                         text=[money(v) if pd.notna(v) else "N/A" for v in cat_summary["_avg_pred"]],
+#                         textposition="outside",
+#                         cliponaxis=False,
+#                         textfont=dict(size=10, color="#172033"),
+#                         hovertemplate="<b>%{x}</b><br>Avg Predicted: %{text}<extra></extra>",
+#                     )
+#                 )
+#                 max_cat_y = float(
+#                     np.nanmax([cat_summary["_avg_actual"].max(), cat_summary["_avg_pred"].max()])
+#                 )
+#                 max_cat_y = max_cat_y if pd.notna(max_cat_y) and max_cat_y > 0 else 1000.0
+#                 fig_cat = style_chart(fig_cat, h=340)
+#                 fig_cat.update_layout(
+#                     barmode="group",
+#                     bargap=0.22,
+#                     bargroupgap=0.08,
+#                     margin=dict(l=12, r=16, t=44, b=28),
+#                     legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+#                 )
+#                 fig_cat.update_xaxes(
+#                     title_text="Product Category",
+#                     tickangle=-18 if len(cat_summary) > 5 else 0,
+#                 )
+#                 fig_cat.update_yaxes(
+#                     title_text=f"Average Annual Spending ({CURRENCY})",
+#                     tickprefix=CURRENCY,
+#                     tickformat="~s",
+#                     gridcolor="#e2e8f0",
+#                     range=[0, max_cat_y * 1.28],
+#                 )
+#                 st.plotly_chart(fig_cat, use_container_width=True)
+#                 st.markdown("</div>", unsafe_allow_html=True)
 
-            with cat_col_tbl:
-                with st.container(border=True):
-                    st.markdown('<div class="ct">📋 Category Summary</div>', unsafe_allow_html=True)
-                    cat_display = pd.DataFrame({
-                        "Product Category": cat_summary["Product Category"],
-                        "Customer Count": cat_summary["Customer Count"].map(lambda x: f"{x:,}"),
-                        "Avg Actual Spending": cat_summary["_avg_actual"].map(lambda v: money(v) if pd.notna(v) else "N/A"),
-                        "Avg Predicted Spending": cat_summary["_avg_pred"].map(lambda v: money(v) if pd.notna(v) else "N/A"),
-                        "Mean Absolute Error": cat_summary["_mae"].map(lambda v: money(v) if pd.notna(v) else "N/A"),
-                    })
-                    st.dataframe(cat_display, hide_index=True, use_container_width=True)
+#             with cat_col_tbl:
+#                 with st.container(border=True):
+#                     st.markdown('<div class="ct">📋 Category Summary</div>', unsafe_allow_html=True)
+#                     cat_display = pd.DataFrame({
+#                         "Product Category": cat_summary["Product Category"],
+#                         "Customer Count": cat_summary["Customer Count"].map(lambda x: f"{x:,}"),
+#                         "Avg Actual Spending": cat_summary["_avg_actual"].map(lambda v: money(v) if pd.notna(v) else "N/A"),
+#                         "Avg Predicted Spending": cat_summary["_avg_pred"].map(lambda v: money(v) if pd.notna(v) else "N/A"),
+#                         "Mean Absolute Error": cat_summary["_mae"].map(lambda v: money(v) if pd.notna(v) else "N/A"),
+#                     })
+#                     st.dataframe(cat_display, hide_index=True, use_container_width=True)
 
-        st.write("")
+#         st.write("")
 
-    # ---------------- 7. PREDICTION ACCURACY ANALYSIS ----------------
-    st.markdown('<div class="sec" style="margin-bottom:4px;">Prediction Accuracy Analysis</div>', unsafe_allow_html=True)
-    st.markdown(
-        '<div style="color:#475569;font-size:0.82rem;margin-bottom:10px;">'
-        'ℹ️ These evaluation metrics measure <b>regression model accuracy</b> on the filtered cohort '
-        '(comparing predicted vs. observed <code>AnnualPurchaseAmount</code>), not customer revenue.</div>',
-        unsafe_allow_html=True,
-    )
+#     # ---------------- 7. PREDICTION ACCURACY ANALYSIS ----------------
+#     st.markdown('<div class="sec" style="margin-bottom:4px;">Prediction Accuracy Analysis</div>', unsafe_allow_html=True)
+#     st.markdown(
+#         '<div style="color:#475569;font-size:0.82rem;margin-bottom:10px;">'
+#         'ℹ️ These evaluation metrics measure <b>regression model accuracy</b> on the filtered cohort '
+#         '(comparing predicted vs. observed <code>AnnualPurchaseAmount</code>), not customer revenue.</div>',
+#         unsafe_allow_html=True,
+#     )
 
-    if valid_both.empty:
-        st.info("Actual `AnnualPurchaseAmount` values are unavailable in this dataset, so error metrics cannot be computed.")
-    else:
-        y_true = valid_both["_actual_spend"].to_numpy(dtype=float)
-        y_hat = valid_both["PredictedAnnualPurchaseAmount"].to_numpy(dtype=float)
-        err_diff = y_true - y_hat
+#     if valid_both.empty:
+#         st.info("Actual `AnnualPurchaseAmount` values are unavailable in this dataset, so error metrics cannot be computed.")
+#     else:
+#         y_true = valid_both["_actual_spend"].to_numpy(dtype=float)
+#         y_hat = valid_both["PredictedAnnualPurchaseAmount"].to_numpy(dtype=float)
+#         err_diff = y_true - y_hat
 
-        mae_score = float(np.mean(np.abs(err_diff)))
-        rmse_score = float(np.sqrt(np.mean(err_diff ** 2)))
+#         mae_score = float(np.mean(np.abs(err_diff)))
+#         rmse_score = float(np.sqrt(np.mean(err_diff ** 2)))
 
-        if len(y_true) >= 2 and float(np.var(y_true)) > 1e-12:
-            ss_res = float(np.sum(err_diff ** 2))
-            ss_tot = float(np.sum((y_true - np.mean(y_true)) ** 2))
-            r2_txt = f"{1.0 - (ss_res / ss_tot):.4f}"
-            r2_sub = f"Variance explained ({len(y_true):,} samples)"
-        else:
-            r2_txt = "N/A"
-            r2_sub = "Requires ≥ 2 samples with spend variance"
+#         if len(y_true) >= 2 and float(np.var(y_true)) > 1e-12:
+#             ss_res = float(np.sum(err_diff ** 2))
+#             ss_tot = float(np.sum((y_true - np.mean(y_true)) ** 2))
+#             r2_txt = f"{1.0 - (ss_res / ss_tot):.4f}"
+#             r2_sub = f"Variance explained ({len(y_true):,} samples)"
+#         else:
+#             r2_txt = "N/A"
+#             r2_sub = "Requires ≥ 2 samples with spend variance"
 
-        acc_left, acc_right = st.columns([1, 1.35])
-        with acc_left:
-            with st.container(border=True):
-                st.markdown('<div class="ct">📐 Model Evaluation Metrics</div>', unsafe_allow_html=True)
-                st.markdown(
-                    f"""
-                    <div style="display:grid;grid-template-columns:1fr;gap:10px;margin-top:6px;">
-                        <div style="background:#f8f9fc;border-left:4px solid #3b82f6;border-radius:8px;padding:10px 14px;">
-                            <div style="font-size:0.72rem;color:#475569;font-weight:700;">MAE (MEAN ABSOLUTE ERROR)</div>
-                            <div style="font-size:1.35rem;font-weight:800;color:#111a3b;">{money(mae_score)}</div>
-                            <div style="font-size:0.72rem;color:#64748b;">Average absolute rupee deviation per customer</div>
-                        </div>
-                        <div style="background:#f8f9fc;border-left:4px solid #8b5cf6;border-radius:8px;padding:10px 14px;">
-                            <div style="font-size:0.72rem;color:#475569;font-weight:700;">RMSE (ROOT MEAN SQUARED ERROR)</div>
-                            <div style="font-size:1.35rem;font-weight:800;color:#111a3b;">{money(rmse_score)}</div>
-                            <div style="font-size:0.72rem;color:#64748b;">Penalizes large outlier spending errors</div>
-                        </div>
-                        <div style="background:#f8f9fc;border-left:4px solid #22c277;border-radius:8px;padding:10px 14px;">
-                            <div style="font-size:0.72rem;color:#475569;font-weight:700;">R² SCORE (COEFFICIENT OF DETERMINATION)</div>
-                            <div style="font-size:1.35rem;font-weight:800;color:#111a3b;">{r2_txt}</div>
-                            <div style="font-size:0.72rem;color:#64748b;">{r2_sub}</div>
-                        </div>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
+#         acc_left, acc_right = st.columns([1, 1.35])
+#         with acc_left:
+#             with st.container(border=True):
+#                 st.markdown('<div class="ct">📐 Model Evaluation Metrics</div>', unsafe_allow_html=True)
+#                 st.markdown(
+#                     f"""
+#                     <div style="display:grid;grid-template-columns:1fr;gap:10px;margin-top:6px;">
+#                         <div style="background:#f8f9fc;border-left:4px solid #3b82f6;border-radius:8px;padding:10px 14px;">
+#                             <div style="font-size:0.72rem;color:#475569;font-weight:700;">MAE (MEAN ABSOLUTE ERROR)</div>
+#                             <div style="font-size:1.35rem;font-weight:800;color:#111a3b;">{money(mae_score)}</div>
+#                             <div style="font-size:0.72rem;color:#64748b;">Average absolute rupee deviation per customer</div>
+#                         </div>
+#                         <div style="background:#f8f9fc;border-left:4px solid #8b5cf6;border-radius:8px;padding:10px 14px;">
+#                             <div style="font-size:0.72rem;color:#475569;font-weight:700;">RMSE (ROOT MEAN SQUARED ERROR)</div>
+#                             <div style="font-size:1.35rem;font-weight:800;color:#111a3b;">{money(rmse_score)}</div>
+#                             <div style="font-size:0.72rem;color:#64748b;">Penalizes large outlier spending errors</div>
+#                         </div>
+#                         <div style="background:#f8f9fc;border-left:4px solid #22c277;border-radius:8px;padding:10px 14px;">
+#                             <div style="font-size:0.72rem;color:#475569;font-weight:700;">R² SCORE (COEFFICIENT OF DETERMINATION)</div>
+#                             <div style="font-size:1.35rem;font-weight:800;color:#111a3b;">{r2_txt}</div>
+#                             <div style="font-size:0.72rem;color:#64748b;">{r2_sub}</div>
+#                         </div>
+#                     </div>
+#                     """,
+#                     unsafe_allow_html=True,
+#                 )
 
-        with acc_right:
-            err_df = cat_summary if not cat_summary.empty else reg_summary
-            err_dim = "Product Category" if not cat_summary.empty else "Region"
-            if not err_df.empty and err_df["_mae"].notna().any():
-                err_sorted = err_df.dropna(subset=["_mae"]).sort_values("_mae", ascending=False)
-                st.markdown(
-                    f'<div class="card"><h4>Mean Absolute Prediction Error by {err_dim}</h4>',
-                    unsafe_allow_html=True,
-                )
-                fig_err = go.Figure(
-                    go.Bar(
-                        x=err_sorted[err_dim],
-                        y=err_sorted["_mae"],
-                        marker_color="#fb923c",
-                        text=[money(v) for v in err_sorted["_mae"]],
-                        textposition="outside",
-                        cliponaxis=False,
-                        textfont=dict(size=11, color="#172033"),
-                        hovertemplate="<b>%{x}</b><br>MAE: %{text}<extra></extra>",
-                    )
-                )
-                max_err_y = float(err_sorted["_mae"].max()) if err_sorted["_mae"].max() > 0 else 1000.0
-                fig_err = style_chart(fig_err, h=305)
-                fig_err.update_layout(margin=dict(l=12, r=16, t=28, b=24), showlegend=False)
-                fig_err.update_xaxes(
-                    title_text=err_dim,
-                    tickangle=-18 if len(err_sorted) > 5 else 0,
-                )
-                fig_err.update_yaxes(
-                    title_text=f"Mean Absolute Error ({CURRENCY})",
-                    tickprefix=CURRENCY,
-                    tickformat="~s",
-                    gridcolor="#e2e8f0",
-                    range=[0, max_err_y * 1.28],
-                )
-                st.plotly_chart(fig_err, use_container_width=True)
-                st.markdown("</div>", unsafe_allow_html=True)
-            else:
-                st.info("Insufficient regional or category breakdown to plot prediction error.")
+#         with acc_right:
+#             err_df = cat_summary if not cat_summary.empty else reg_summary
+#             err_dim = "Product Category" if not cat_summary.empty else "Region"
+#             if not err_df.empty and err_df["_mae"].notna().any():
+#                 err_sorted = err_df.dropna(subset=["_mae"]).sort_values("_mae", ascending=False)
+#                 st.markdown(
+#                     f'<div class="card"><h4>Mean Absolute Prediction Error by {err_dim}</h4>',
+#                     unsafe_allow_html=True,
+#                 )
+#                 fig_err = go.Figure(
+#                     go.Bar(
+#                         x=err_sorted[err_dim],
+#                         y=err_sorted["_mae"],
+#                         marker_color="#fb923c",
+#                         text=[money(v) for v in err_sorted["_mae"]],
+#                         textposition="outside",
+#                         cliponaxis=False,
+#                         textfont=dict(size=11, color="#172033"),
+#                         hovertemplate="<b>%{x}</b><br>MAE: %{text}<extra></extra>",
+#                     )
+#                 )
+#                 max_err_y = float(err_sorted["_mae"].max()) if err_sorted["_mae"].max() > 0 else 1000.0
+#                 fig_err = style_chart(fig_err, h=305)
+#                 fig_err.update_layout(margin=dict(l=12, r=16, t=28, b=24), showlegend=False)
+#                 fig_err.update_xaxes(
+#                     title_text=err_dim,
+#                     tickangle=-18 if len(err_sorted) > 5 else 0,
+#                 )
+#                 fig_err.update_yaxes(
+#                     title_text=f"Mean Absolute Error ({CURRENCY})",
+#                     tickprefix=CURRENCY,
+#                     tickformat="~s",
+#                     gridcolor="#e2e8f0",
+#                     range=[0, max_err_y * 1.28],
+#                 )
+#                 st.plotly_chart(fig_err, use_container_width=True)
+#                 st.markdown("</div>", unsafe_allow_html=True)
+#             else:
+#                 st.info("Insufficient regional or category breakdown to plot prediction error.")
 
-    st.write("")
+#     st.write("")
 
-    # ---------------- 8. DYNAMIC BUSINESS INSIGHTS ----------------
-    st.markdown('<div class="sec" style="margin-bottom:8px;">Business Insights</div>', unsafe_allow_html=True)
-    insight_cards = []
+#     # ---------------- 8. DYNAMIC BUSINESS INSIGHTS ----------------
+#     st.markdown('<div class="sec" style="margin-bottom:8px;">Business Insights</div>', unsafe_allow_html=True)
+#     insight_cards = []
 
-    if not reg_summary.empty and reg_summary["_avg_actual"].notna().any():
-        top_reg_row = reg_summary.dropna(subset=["_avg_actual"]).iloc[0]
-        insight_cards.append((
-            "🌍", "#e8f1fd", "#3b82f6",
-            f"Highest-Spending Region: {top_reg_row['Region']}",
-            f"Customers in {top_reg_row['Region']} record the highest average actual annual spend at "
-            f"{money(top_reg_row['_avg_actual'])} (vs. {money(top_reg_row['_avg_pred'])} predicted).",
-        ))
+#     if not reg_summary.empty and reg_summary["_avg_actual"].notna().any():
+#         top_reg_row = reg_summary.dropna(subset=["_avg_actual"]).iloc[0]
+#         insight_cards.append((
+#             "🌍", "#e8f1fd", "#3b82f6",
+#             f"Highest-Spending Region: {top_reg_row['Region']}",
+#             f"Customers in {top_reg_row['Region']} record the highest average actual annual spend at "
+#             f"{money(top_reg_row['_avg_actual'])} (vs. {money(top_reg_row['_avg_pred'])} predicted).",
+#         ))
 
-    if not reg_summary.empty and reg_summary["_mae"].notna().any():
-        worst_reg_row = reg_summary.dropna(subset=["_mae"]).sort_values("_mae", ascending=False).iloc[0]
-        insight_cards.append((
-            "⚠️", "#fdf3df", "#fb923c",
-            f"Largest Regional Prediction Error: {worst_reg_row['Region']}",
-            f"{worst_reg_row['Region']} shows the highest MAE at {money(worst_reg_row['_mae'])} across "
-            f"{int(worst_reg_row['Customer Count']):,} customers, indicating higher spending variance.",
-        ))
+#     if not reg_summary.empty and reg_summary["_mae"].notna().any():
+#         worst_reg_row = reg_summary.dropna(subset=["_mae"]).sort_values("_mae", ascending=False).iloc[0]
+#         insight_cards.append((
+#             "⚠️", "#fdf3df", "#fb923c",
+#             f"Largest Regional Prediction Error: {worst_reg_row['Region']}",
+#             f"{worst_reg_row['Region']} shows the highest MAE at {money(worst_reg_row['_mae'])} across "
+#             f"{int(worst_reg_row['Customer Count']):,} customers, indicating higher spending variance.",
+#         ))
 
-    if not cat_summary.empty and cat_summary["_avg_actual"].notna().any():
-        top_cat_row = cat_summary.dropna(subset=["_avg_actual"]).iloc[0]
-        insight_cards.append((
-            "🛍️", "#e3f6ec", "#22c277",
-            f"Top-Spending Category: {top_cat_row['Product Category']}",
-            f"{top_cat_row['Product Category']} leads all categories with {money(top_cat_row['_avg_actual'])} "
-            f"in average actual annual spending ({int(top_cat_row['Customer Count']):,} customers).",
-        ))
+#     if not cat_summary.empty and cat_summary["_avg_actual"].notna().any():
+#         top_cat_row = cat_summary.dropna(subset=["_avg_actual"]).iloc[0]
+#         insight_cards.append((
+#             "🛍️", "#e3f6ec", "#22c277",
+#             f"Top-Spending Category: {top_cat_row['Product Category']}",
+#             f"{top_cat_row['Product Category']} leads all categories with {money(top_cat_row['_avg_actual'])} "
+#             f"in average actual annual spending ({int(top_cat_row['Customer Count']):,} customers).",
+#         ))
 
-    if not cat_summary.empty and cat_summary["_bias"].notna().any():
-        valid_bias = cat_summary.dropna(subset=["_bias"])
-        over_cats = valid_bias[valid_bias["_bias"] > 0].sort_values("_bias", ascending=False)
-        if not over_cats.empty:
-            r_over = over_cats.iloc[0]
-            insight_cards.append((
-                "📈", "#f0eafd", "#8b5cf6",
-                f"Predicted Above Actual: {r_over['Product Category']}",
-                f"Model predictions for {r_over['Product Category']} ({money(r_over['_avg_pred'])}) exceed "
-                f"actual spending ({money(r_over['_avg_actual'])}) by {money(r_over['_bias'])} on average.",
-            ))
-        under_cats = valid_bias[valid_bias["_bias"] < 0].sort_values("_bias", ascending=True)
-        if not under_cats.empty:
-            r_under = under_cats.iloc[0]
-            insight_cards.append((
-                "📉", "#fce7f3", "#f43f5e",
-                f"Predicted Below Actual: {r_under['Product Category']}",
-                f"Actual spending in {r_under['Product Category']} ({money(r_under['_avg_actual'])}) outpaces "
-                f"model predictions ({money(r_under['_avg_pred'])}) by {money(abs(r_under['_bias']))} on average.",
-            ))
+#     if not cat_summary.empty and cat_summary["_bias"].notna().any():
+#         valid_bias = cat_summary.dropna(subset=["_bias"])
+#         over_cats = valid_bias[valid_bias["_bias"] > 0].sort_values("_bias", ascending=False)
+#         if not over_cats.empty:
+#             r_over = over_cats.iloc[0]
+#             insight_cards.append((
+#                 "📈", "#f0eafd", "#8b5cf6",
+#                 f"Predicted Above Actual: {r_over['Product Category']}",
+#                 f"Model predictions for {r_over['Product Category']} ({money(r_over['_avg_pred'])}) exceed "
+#                 f"actual spending ({money(r_over['_avg_actual'])}) by {money(r_over['_bias'])} on average.",
+#             ))
+#         under_cats = valid_bias[valid_bias["_bias"] < 0].sort_values("_bias", ascending=True)
+#         if not under_cats.empty:
+#             r_under = under_cats.iloc[0]
+#             insight_cards.append((
+#                 "📉", "#fce7f3", "#f43f5e",
+#                 f"Predicted Below Actual: {r_under['Product Category']}",
+#                 f"Actual spending in {r_under['Product Category']} ({money(r_under['_avg_actual'])}) outpaces "
+#                 f"model predictions ({money(r_under['_avg_pred'])}) by {money(abs(r_under['_bias']))} on average.",
+#             ))
 
-    if not insight_cards:
-        st.info("Insufficient regional, category, or actual spending data in the current filter selection to generate insights.")
-    else:
-        for row_start in range(0, len(insight_cards), 3):
-            batch = insight_cards[row_start : row_start + 3]
-            cols = st.columns(len(batch))
-            for idx, (icon, bg, accent, title, desc) in enumerate(batch):
-                with cols[idx]:
-                    st.markdown(
-                        f"""
-                        <div class="card" style="border-top:4px solid {accent};height:100%;">
-                            <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">
-                                <div style="width:36px;height:36px;border-radius:50%;background:{bg};
-                                            display:flex;align-items:center;justify-content:center;font-size:1.1rem;flex-shrink:0;">{icon}</div>
-                                <div style="font-size:0.9rem;font-weight:800;color:#111a3b;line-height:1.25;">{title}</div>
-                            </div>
-                            <div style="font-size:0.78rem;color:#475569;line-height:1.45;">{desc}</div>
-                        </div>
-                        """,
-                        unsafe_allow_html=True,
-                    )            
+#     if not insight_cards:
+#         st.info("Insufficient regional, category, or actual spending data in the current filter selection to generate insights.")
+#     else:
+#         for row_start in range(0, len(insight_cards), 3):
+#             batch = insight_cards[row_start : row_start + 3]
+#             cols = st.columns(len(batch))
+#             for idx, (icon, bg, accent, title, desc) in enumerate(batch):
+#                 with cols[idx]:
+#                     st.markdown(
+#                         f"""
+#                         <div class="card" style="border-top:4px solid {accent};height:100%;">
+#                             <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">
+#                                 <div style="width:36px;height:36px;border-radius:50%;background:{bg};
+#                                             display:flex;align-items:center;justify-content:center;font-size:1.1rem;flex-shrink:0;">{icon}</div>
+#                                 <div style="font-size:0.9rem;font-weight:800;color:#111a3b;line-height:1.25;">{title}</div>
+#                             </div>
+#                             <div style="font-size:0.78rem;color:#475569;line-height:1.45;">{desc}</div>
+#                         </div>
+#                         """,
+#                         unsafe_allow_html=True,
+#                     )            
+
 def guess(cols, keywords, exclude=()):
     for kw in keywords:
         for c in cols:
